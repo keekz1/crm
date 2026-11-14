@@ -1,0 +1,26 @@
+# AWS Amplify Hosting build (Gen 2).
+# backend:  deploys Cognito + AppSync + DynamoDB + Lambda from the amplify/ folder,
+#           and writes amplify_outputs.json (endpoints, user pool ids) for the app.
+# frontend: builds the web app with Vite and publishes dist/.
+version: 1
+backend:
+  phases:
+    build:
+      commands:
+        - nvm use 20 || true
+        - npm install --no-audit --no-fund
+        - npx ampx pipeline-deploy --branch $AWS_BRANCH --app-id $AWS_APP_ID
+frontend:
+  phases:
+    build:
+      commands:
+        - mkdir -p public && cp amplify_outputs.json public/amplify_outputs.json
+        - npm run build
+  artifacts:
+    baseDirectory: dist
+    files:
+      - '**/*'
+  cache:
+    paths:
+      - node_modules/**/*
+      - .npm/**/*

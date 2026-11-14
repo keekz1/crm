@@ -1,0 +1,180 @@
+import { type ClientSchema, a, defineData } from "@aws-amplify/backend";
+import { adminUsers } from "./admin-users/resource";
+
+/**
+ * Who can see what (enforced by AppSync on every request):
+ *   Department        -> MANAGERS: everything. Members: read only the departments they belong to.
+ *   Ticket, activity  -> MANAGERS: everything. Members: only records whose departmentGroup is one
+ *                        of their Cognito groups. Only MANAGERS can delete.
+ *   Company, Contact  -> shared customer directory for all approved staff; only MANAGERS delete.
+ *   Profile           -> each user manages their own; staff can read names.
+ * Users in no group ("pending") can only read their own Profile.
+ * Accounts are invite-only: managers add people from the app (see admin-users).
+ */
+const schema = a.schema({
+  Profile: a
+    .model({
+      email: a.string(),
+      fullName: a.string(),
+    })
+    .authorization((allow) => [allow.owner(), allow.groups(["MANAGERS", "STAFF"]).to(["read"])]),
+
+  Department: a
+    .model({
+      name: a.string().required(),
+      code: a.string().required(), // ticket prefix, e.g. IT -> IT-1001
+      kind: a.string().required(), // support | pipeline
+      groupName: a.string().required(), // Cognito group, e.g. dept-k3x9a2
+      color: a.string(),
+      description: a.string(),
+      memberIds: a.string().array(), // user ids, maintained by managers (for assignee pickers)
+    })
+    .authorization((allow) => [allow.groups(["MANAGERS"]), allow.groupDefinedIn("groupName").to(["read"])]),
+
+  Ticket: a
+    .model({
+      departmentId: a.id().required(),
+      departmentGroup: a.string().required(),
+      ref: a.integer(),
+      refCode: a.string(),
+      title: a.string().required(),
+      description: a.string(),
+      contactId: a.id(),
+      companyId: a.id(),
+      assigneeId: a.string(),
+      // support departments
+      category: a.string(),
+      priority: a.string(), // urgent | high | normal | low
+      status: a.string(), // open | in_progress | waiting | resolved | closed
+      slaDue: a.datetime(),
+      resolvedAt: a.datetime(),
+      // pipeline departments
+      stage: a.string(), // new | qualified | proposal | negotiation | won | lost
+      value: a.float(),
+      expectedClose: a.date(),
+      source: a.string(),
+      lostReason: a.string(),
+      closedAt: a.datetime(),
+      createdBy: a.string(),
+    })
+    .authorization((allow) => [
+      allow.groups(["MANAGERS"]),
+      allow.groupDefinedIn("departmentGroup").to(["create", "read", "update"]),
+    ]),
+
+  TicketActivity: a
+    .model({
+      ticketId: a.id().required(),
+      departmentGroup: a.string().required(),
+      authorId: a.string(),
+      kind: a.string(), // note | call | email | meeting | system
+      body: a.string().required(),
+    })
+    .authorization((allow) => [
+      allow.groups(["MANAGERS"]),
+      allow.groupDefinedIn("departmentGroup").to(["create", "read"]),
+    ]),
+
+  Company: a
+    .model({
+      name: a.string().required(),
+      website: a.string(),
+      industry: a.string(),
+      phone: a.string(),
+      address: a.string(),
+      notes: a.string(),
+      createdBy: a.string(),
+    })
+    .authorization((allow) => [allow.groups(["MANAGERS"]), allow.groups(["STAFF"]).to(["create", "read", "update"])]),
+
+  Contact: a
+    .model({
+      companyId: a.id(),
+      fullName: a.string().required(),
+      email: a.string(),
+      phone: a.string(),
+      jobTitle: a.string(),
+      notes: a.string(),
+      createdBy: a.string(),
+    })
+    .authorization((allow) => [allow.groups(["MANAGERS"]), allow.groups(["STAFF"]).to(["create", "read", "update"])]),
+
+  // Per-department ticket number counters. Only reachable through nextRef.
+  Counter: a
+    .model({
+      value: a.integer(),
+    })
+    .authorization((allow) => [allow.groups(["MANAGERS"])]),
+
+  nextRef: a
+    .mutation()
+    .arguments({ key: a.string().required() })
+    .returns(a.integer())
+    .authorization((allow) => [allow.groups(["MANAGERS", "STAFF"])])
+    .handler(a.handler.custom({ dataSource: a.ref("Counter"), entry: "./next-ref.js" })),
+
+  // Manager-only team administration (Cognito groups)
+  listStaff: a
+    .query()
+    .returns(a.json())
+    .authorization((allow) => [allow.groups(["MANAGERS"])])
+    .handler(a.handler.function(adminUsers)),
+
+  inviteUser: a
+    .mutation()
+    .arguments({ email: a.string().required(), name: a.string(), manager: a.boolean().required(), departments: a.string().array() })
+    .returns(a.json())
+    .authorization((allow) => [allow.groups(["MANAGERS"])])
+    .handler(a.handler.function(adminUsers)),
+
+  resendInvite: a
+    .mutation()
+    .arguments({ username: a.string().required() })
+    .returns(a.json())
+    .authorization((allow) => [allow.groups(["MANAGERS"])])
+    .handler(a.handler.function(adminUsers)),
+
+  setUserEnabled: a
+    .mutation()
+    .arguments({ username: a.string().required(), enabled: a.boolean().required() })
+    .returns(a.json())
+    .authorization((allow) => [allow.groups(["MANAGERS"])])
+    .handler(a.handler.function(adminUsers)),
+
+  removeUser: a
+    .mutation()
+    .arguments({ username: a.string().required() })
+    .returns(a.json())
+    .authorization((allow) => [allow.groups(["MANAGERS"])])
+    .handler(a.handler.function(adminUsers)),
+
+  setUserAccess: a
+    .mutation()
+    .arguments({ username: a.string().required(), manager: a.boolean().required(), departments: a.string().array() })
+    .returns(a.json())
+    .authorization((allow) => [allow.groups(["MANAGERS"])])
+    .handler(a.handler.function(adminUsers)),
+
+  ensureDepartmentGroup: a
+    .mutation()
+    .arguments({ groupName: a.string().required() })
+    .returns(a.json())
+    .authorization((allow) => [allow.groups(["MANAGERS"])])
+    .handler(a.handler.function(adminUsers)),
+
+  removeDepartmentGroup: a
+    .mutation()
+    .arguments({ groupName: a.string().required() })
+    .returns(a.json())
+    .authorization((allow) => [allow.groups(["MANAGERS"])])
+    .handler(a.handler.function(adminUsers)),
+});
+
+export type Schema = ClientSchema<typeof schema>;
+
+export const data = defineData({
+  schema,
+  authorizationModes: {
+    defaultAuthorizationMode: "userPool",
+  },
+});

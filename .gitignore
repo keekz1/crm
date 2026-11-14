@@ -1,0 +1,7 @@
+node_modules/
+dist/
+.amplify/
+amplify_outputs.json
+public/amplify_outputs.json
+tests/ui/screenshots/
+.DS_Store
