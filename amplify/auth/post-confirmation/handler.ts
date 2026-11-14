@@ -6,22 +6,24 @@ import {
 
 const cognito = new CognitoIdentityProviderClient();
 
-// If nobody is an admin yet, make this new user the admin. Everyone else starts with no group (pending).
+// If nobody is a manager yet, make this new user the manager. Everyone else starts with no group (pending).
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export const handler = async (event: any) => {
   if (event.triggerSource !== "PostConfirmation_ConfirmSignUp") return event;
   try {
-    const admins = await cognito.send(
-      new ListUsersInGroupCommand({ UserPoolId: event.userPoolId, GroupName: "ADMINS", Limit: 1 })
+    const managers = await cognito.send(
+      new ListUsersInGroupCommand({ UserPoolId: event.userPoolId, GroupName: "MANAGERS", Limit: 1 })
     );
-    if (!admins.Users || admins.Users.length === 0) {
-      await cognito.send(
-        new AdminAddUserToGroupCommand({ UserPoolId: event.userPoolId, Username: event.userName, GroupName: "ADMINS" })
-      );
-      console.log("First user made admin", event.userName);
+    if (!managers.Users || managers.Users.length === 0) {
+      for (const GroupName of ["MANAGERS", "STAFF"]) {
+        await cognito.send(
+          new AdminAddUserToGroupCommand({ UserPoolId: event.userPoolId, Username: event.userName, GroupName })
+        );
+      }
+      console.log("First user made manager", event.userName);
     }
   } catch (err) {
-    // Never block sign-up because of this; an admin can be assigned in the AWS console.
+    // Never block sign-up because of this; a manager can be assigned in the AWS console.
     console.error("post-confirmation failed", err);
   }
   return event;

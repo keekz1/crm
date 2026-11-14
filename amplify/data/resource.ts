@@ -2,22 +2,77 @@ import { type ClientSchema, a, defineData } from "@aws-amplify/backend";
 import { adminUsers } from "./admin-users/resource";
 
 /**
- * Access is enforced by AppSync on every request, not by the UI:
- *   Company, Contact          -> ADMINS, SALES, IT (only ADMINS may delete)
- *   Deal, DealActivity        -> ADMINS, SALES      (IT can't read or write)
- *   Ticket, TicketActivity    -> ADMINS, IT         (Sales can't read or write)
- *   Profile                   -> each user manages their own; staff can read names
- * Users in no group can only read their own Profile.
+ * Who can see what (enforced by AppSync on every request):
+ *   Department        -> MANAGERS: everything. Members: read only the departments they belong to.
+ *   Ticket, activity  -> MANAGERS: everything. Members: only records whose departmentGroup is one
+ *                        of their Cognito groups. Only MANAGERS can delete.
+ *   Company, Contact  -> shared customer directory for all approved staff; only MANAGERS delete.
+ *   Profile           -> each user manages their own; staff can read names.
+ * Users in no group ("pending") can only read their own Profile.
  */
-const STAFF = ["ADMINS", "SALES", "IT"];
-
 const schema = a.schema({
   Profile: a
     .model({
       email: a.string(),
       fullName: a.string(),
     })
-    .authorization((allow) => [allow.owner(), allow.groups(STAFF).to(["read"])]),
+    .authorization((allow) => [allow.owner(), allow.groups(["MANAGERS", "STAFF"]).to(["read"])]),
+
+  Department: a
+    .model({
+      name: a.string().required(),
+      code: a.string().required(), // ticket prefix, e.g. IT -> IT-1001
+      kind: a.string().required(), // support | pipeline
+      groupName: a.string().required(), // Cognito group, e.g. dept-k3x9a2
+      color: a.string(),
+      description: a.string(),
+      memberIds: a.string().array(), // user ids, maintained by managers (for assignee pickers)
+    })
+    .authorization((allow) => [allow.groups(["MANAGERS"]), allow.groupDefinedIn("groupName").to(["read"])]),
+
+  Ticket: a
+    .model({
+      departmentId: a.id().required(),
+      departmentGroup: a.string().required(),
+      ref: a.integer(),
+      refCode: a.string(),
+      title: a.string().required(),
+      description: a.string(),
+      contactId: a.id(),
+      companyId: a.id(),
+      assigneeId: a.string(),
+      // support departments
+      category: a.string(),
+      priority: a.string(), // urgent | high | normal | low
+      status: a.string(), // open | in_progress | waiting | resolved | closed
+      slaDue: a.datetime(),
+      resolvedAt: a.datetime(),
+      // pipeline departments
+      stage: a.string(), // new | qualified | proposal | negotiation | won | lost
+      value: a.float(),
+      expectedClose: a.date(),
+      source: a.string(),
+      lostReason: a.string(),
+      closedAt: a.datetime(),
+      createdBy: a.string(),
+    })
+    .authorization((allow) => [
+      allow.groups(["MANAGERS"]),
+      allow.groupDefinedIn("departmentGroup").to(["create", "read", "update"]),
+    ]),
+
+  TicketActivity: a
+    .model({
+      ticketId: a.id().required(),
+      departmentGroup: a.string().required(),
+      authorId: a.string(),
+      kind: a.string(), // note | call | email | meeting | system
+      body: a.string().required(),
+    })
+    .authorization((allow) => [
+      allow.groups(["MANAGERS"]),
+      allow.groupDefinedIn("departmentGroup").to(["create", "read"]),
+    ]),
 
   Company: a
     .model({
@@ -29,10 +84,7 @@ const schema = a.schema({
       notes: a.string(),
       createdBy: a.string(),
     })
-    .authorization((allow) => [
-      allow.groups(["ADMINS"]),
-      allow.groups(["SALES", "IT"]).to(["create", "read", "update"]),
-    ]),
+    .authorization((allow) => [allow.groups(["MANAGERS"]), allow.groups(["STAFF"]).to(["create", "read", "update"])]),
 
   Contact: a
     .model({
@@ -44,90 +96,48 @@ const schema = a.schema({
       notes: a.string(),
       createdBy: a.string(),
     })
-    .authorization((allow) => [
-      allow.groups(["ADMINS"]),
-      allow.groups(["SALES", "IT"]).to(["create", "read", "update"]),
-    ]),
+    .authorization((allow) => [allow.groups(["MANAGERS"]), allow.groups(["STAFF"]).to(["create", "read", "update"])]),
 
-  Deal: a
-    .model({
-      ref: a.integer(),
-      title: a.string().required(),
-      companyId: a.id(),
-      contactId: a.id(),
-      value: a.float(),
-      stage: a.string().required(), // new | qualified | proposal | negotiation | won | lost
-      ownerId: a.string(),
-      expectedClose: a.date(),
-      source: a.string(),
-      description: a.string(),
-      lostReason: a.string(),
-      closedAt: a.datetime(),
-      createdBy: a.string(),
-    })
-    .authorization((allow) => [allow.groups(["ADMINS", "SALES"])]),
-
-  DealActivity: a
-    .model({
-      dealId: a.id().required(),
-      authorId: a.string(),
-      kind: a.string(), // note | call | email | meeting | system
-      body: a.string().required(),
-    })
-    .authorization((allow) => [allow.groups(["ADMINS", "SALES"])]),
-
-  Ticket: a
-    .model({
-      ref: a.integer(),
-      subject: a.string().required(),
-      description: a.string(),
-      contactId: a.id(),
-      companyId: a.id(),
-      category: a.string(),
-      priority: a.string().required(), // urgent | high | normal | low
-      status: a.string().required(), // open | in_progress | waiting | resolved | closed
-      assigneeId: a.string(),
-      slaDue: a.datetime(),
-      resolvedAt: a.datetime(),
-      createdBy: a.string(),
-    })
-    .authorization((allow) => [allow.groups(["ADMINS", "IT"])]),
-
-  TicketActivity: a
-    .model({
-      ticketId: a.id().required(),
-      authorId: a.string(),
-      kind: a.string(), // note | system
-      body: a.string().required(),
-    })
-    .authorization((allow) => [allow.groups(["ADMINS", "IT"])]),
-
-  // Sequence counters for SAL-/IT- numbers. Only reachable through nextRef.
+  // Per-department ticket number counters. Only reachable through nextRef.
   Counter: a
     .model({
       value: a.integer(),
     })
-    .authorization((allow) => [allow.groups(["ADMINS"])]),
+    .authorization((allow) => [allow.groups(["MANAGERS"])]),
 
   nextRef: a
     .mutation()
-    .arguments({ kind: a.string().required() })
+    .arguments({ key: a.string().required() })
     .returns(a.integer())
-    .authorization((allow) => [allow.groups(["ADMINS", "SALES", "IT"])])
+    .authorization((allow) => [allow.groups(["MANAGERS", "STAFF"])])
     .handler(a.handler.custom({ dataSource: a.ref("Counter"), entry: "./next-ref.js" })),
 
-  // Admin user management (Cognito groups)
+  // Manager-only team administration (Cognito groups)
   listStaff: a
     .query()
     .returns(a.json())
-    .authorization((allow) => [allow.groups(["ADMINS"])])
+    .authorization((allow) => [allow.groups(["MANAGERS"])])
     .handler(a.handler.function(adminUsers)),
 
-  setUserRole: a
+  setUserAccess: a
     .mutation()
-    .arguments({ username: a.string().required(), role: a.string().required() })
+    .arguments({ username: a.string().required(), manager: a.boolean().required(), departments: a.string().array() })
     .returns(a.json())
-    .authorization((allow) => [allow.groups(["ADMINS"])])
+    .authorization((allow) => [allow.groups(["MANAGERS"])])
+    .handler(a.handler.function(adminUsers)),
+
+  ensureDepartmentGroup: a
+    .mutation()
+    .arguments({ groupName: a.string().required() })
+    .returns(a.json())
+    .authorization((allow) => [allow.groups(["MANAGERS"])])
+    .handler(a.handler.function(adminUsers)),
+
+  removeDepartmentGroup: a
+    .mutation()
+    .arguments({ groupName: a.string().required() })
+    .returns(a.json())
+    .authorization((allow) => [allow.groups(["MANAGERS"])])
     .handler(a.handler.function(adminUsers)),
 });
 

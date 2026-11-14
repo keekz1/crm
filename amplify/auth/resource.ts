@@ -3,11 +3,13 @@ import { postConfirmation } from "./post-confirmation/resource";
 import { adminUsers } from "../data/admin-users/resource";
 
 /**
- * Groups decide what each person can see (enforced by the data API):
- *   ADMINS - everything + user management
- *   SALES  - companies, contacts, deals
- *   IT     - companies, contacts, IT tickets
- * Users in no group ("pending") can't read any CRM data.
+ * Cognito groups:
+ *   MANAGERS     - see every department, create departments, manage the team
+ *   STAFF        - any approved user (gives access to the shared customer directory)
+ *   dept-xxxxxx  - one group per department, created by managers from the app.
+ *                  Tickets carry their department's group name and AppSync only
+ *                  returns them to members of that group (or MANAGERS).
+ * Users in no group are "pending" and can't read any CRM data.
  */
 export const auth = defineAuth({
   loginWith: {
@@ -19,7 +21,7 @@ export const auth = defineAuth({
       mutable: true,
     },
   },
-  groups: ["ADMINS", "SALES", "IT"],
+  groups: ["MANAGERS", "STAFF"],
   triggers: {
     postConfirmation,
   },
@@ -27,6 +29,6 @@ export const auth = defineAuth({
     allow.resource(postConfirmation).to(["addUserToGroup", "listUsersInGroup"]),
     allow
       .resource(adminUsers)
-      .to(["listUsers", "listGroupsForUser", "listUsersInGroup", "addUserToGroup", "removeUserFromGroup"]),
+      .to(["listUsers", "listGroupsForUser", "listUsersInGroup", "addUserToGroup", "removeUserFromGroup", "manageGroups"]),
   ],
 });

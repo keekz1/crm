@@ -1,15 +1,15 @@
 import { util } from "@aws-appsync/utils";
 
-// Atomically increments a counter row ("deal" or "ticket") and returns the new value.
-// Used for human-friendly numbers: SAL-1001, IT-1001, ...
+// Atomically increments the counter row for one department (key = department id)
+// and returns the new value. Used for ticket numbers like IT-1001, SAL-1001.
 export function request(ctx) {
-  const kind = ctx.args.kind;
-  if (kind !== "deal" && kind !== "ticket") {
-    util.error("kind must be 'deal' or 'ticket'", "BadRequest");
+  const key = ctx.args.key;
+  if (!key || key.length > 100) {
+    util.error("Invalid counter key", "BadRequest");
   }
   return {
     operation: "UpdateItem",
-    key: util.dynamodb.toMapValues({ id: kind }),
+    key: util.dynamodb.toMapValues({ id: key }),
     update: {
       expression: "ADD #v :one",
       expressionNames: { "#v": "value" },
