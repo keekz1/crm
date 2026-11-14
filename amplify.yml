@@ -1,27 +1,26 @@
-# AWS Amplify Hosting build settings.
-# Set these in Amplify → your app → Hosting → Environment variables:
-#   SUPABASE_URL       e.g. https://abcdefgh.supabase.co
-#   SUPABASE_ANON_KEY  the "anon public" key (never the service_role key)
-#   COMPANY_NAME       optional, shown on the login screen
-# If they're not set, the js/config.js committed in the repo is used as-is.
+# AWS Amplify Hosting build (Gen 2).
+# backend:  deploys Cognito + AppSync + DynamoDB + Lambda from the amplify/ folder,
+#           and writes amplify_outputs.json (endpoints, user pool ids) for the app.
+# frontend: builds the web app with Vite and publishes dist/.
 version: 1
+backend:
+  phases:
+    build:
+      commands:
+        - nvm use 20 || true
+        - npm install --no-audit --no-fund
+        - npx ampx pipeline-deploy --branch $AWS_BRANCH --app-id $AWS_APP_ID
 frontend:
   phases:
     build:
       commands:
-        - rm -rf dist && mkdir -p dist
-        - cp -r index.html css js dist/
-        - |
-          if [ -n "$SUPABASE_URL" ] && [ -n "$SUPABASE_ANON_KEY" ]; then
-            printf 'window.CRM_CONFIG = {\n  SUPABASE_URL: "%s",\n  SUPABASE_ANON_KEY: "%s",\n  COMPANY_NAME: "%s"\n};\n' \
-              "$SUPABASE_URL" "$SUPABASE_ANON_KEY" "${COMPANY_NAME:-CoreCRM}" > dist/js/config.js
-            echo "Wrote dist/js/config.js from environment variables"
-          else
-            echo "SUPABASE_URL / SUPABASE_ANON_KEY not set: using js/config.js from the repo"
-          fi
+        - mkdir -p public && cp amplify_outputs.json public/amplify_outputs.json
+        - npm run build
   artifacts:
     baseDirectory: dist
     files:
       - '**/*'
   cache:
-    paths: []
+    paths:
+      - node_modules/**/*
+      - .npm/**/*
