@@ -56,6 +56,7 @@ Never put the `service_role` key in this file.
 
 ### 3. Host it
 It's static files with no build step. Any of these work:
+- **AWS Amplify** (recommended): **Deploy an app → GitHub → `keekz1/crm` → branch `main`**. The included [`amplify.yml`](amplify.yml) is picked up automatically. Under **Hosting → Environment variables**, add `SUPABASE_URL`, `SUPABASE_ANON_KEY` (and optionally `COMPANY_NAME`), then redeploy. The build writes `js/config.js` from those variables, so your keys don't need to be committed.
 - **GitHub Pages**: repo **Settings → Pages → Deploy from branch → `main` / root**.
 - **Netlify / Vercel / Cloudflare Pages**: import the repo, with no build command and the output directory set to the root.
 - **Locally**: `python3 -m http.server` in this folder, then open http://localhost:8000.
