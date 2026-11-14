@@ -1,8 +1,9 @@
 import { Amplify } from "aws-amplify";
 import {
-  signIn, signUp, confirmSignUp, resendSignUpCode, signOut, getCurrentUser,
-  fetchAuthSession, fetchUserAttributes, resetPassword, confirmResetPassword,
+  signIn, confirmSignIn, signOut, getCurrentUser, fetchAuthSession, fetchUserAttributes,
+  resetPassword, confirmResetPassword, setUpTOTP, verifyTOTPSetup, updateMFAPreference, fetchMFAPreference,
 } from "aws-amplify/auth";
+import QRCode from "qrcode";
 import { generateClient } from "aws-amplify/data";
 import "./app.css";
 
@@ -29,7 +30,7 @@ const label = (list, v) => (list.find(x => x[0] === v) || [, v])[1];
 /* ---------- state ---------- */
 let client = null;
 const S = { user: null, me: null, profiles: [], companies: [], contacts: [], departments: [], tickets: [], staff: null };
-let view = "dashboard", viewDept = null, openRec = null, activity = [], authEmail = "", authPassword = "";
+let view = "dashboard", viewDept = null, openRec = null, activity = [], authEmail = "";
 const F = { board: {}, contacts: { q: "", company: "" }, companies: { q: "" } };
 const boardF = id => F.board[id] || (F.board[id] = { q: "", status: "active", priority: "", assignee: "", owner: "", mine: false });
 
@@ -232,7 +233,10 @@ async function boot(forceRefresh = false) {
   try { attrs = await fetchUserAttributes(); } catch { }
   S.user = { id: user.userId, username: user.username };
   S.me = { id: user.userId, username: user.username, email: attrs.email || user.signInDetails?.loginId || "", fullName: attrs.name || "", groups: g };
+  try { const pref = await fetchMFAPreference(); S.me.mfa = (pref?.enabled || []).includes("TOTP"); } catch { S.me.mfa = false; }
   await ensureProfile();
+  // Managers must use two-step verification. Until it's set up, nothing else is shown.
+  if (isManager() && !S.me.mfa) return showMfaSetup(true);
   if (!isStaff()) return showPending();
   try { await loadAll(); } catch (e) { fail(e); }
   route();
@@ -261,65 +265,110 @@ function showSetup() {
   <li>For local development, run <code>npx ampx sandbox</code>, then <code>npm run dev</code>.</li></ol></div></div>`;
 }
 
+// Sign-in is invite-only: there is no sign-up form. Steps: password -> (new password on first sign-in) -> (authenticator code).
 function showAuth(mode = "signin", msg = "") {
-  const tabs = mode === "signin" || mode === "signup";
-  const titles = { signin: "Sign in to your workspace", signup: "Create your account", confirm: "Check your email", reset: "Reset your password", newpass: "Choose a new password" };
-  const buttons = { signin: "Sign in", signup: "Create account", confirm: "Confirm email", reset: "Send reset code", newpass: "Save password" };
+  const titles = { signin: "Sign in to your workspace", newpw: "Choose your password", totp: "Two-step verification", reset: "Reset your password", newpass: "Choose a new password" };
+  const buttons = { signin: "Sign in", newpw: "Save and continue", totp: "Verify", reset: "Send reset code", newpass: "Save password" };
+  const pwHint = `<div class="hint">At least 8 characters with upper and lower case letters, a number and a symbol.</div>`;
   $("#app").innerHTML = `<div class="auth"><div class="auth-card">
     <h1>${esc(APP_NAME)}</h1><p class="sub">${titles[mode]}</p>
-    ${tabs ? `<div class="auth-tabs"><button data-m="signin" class="${mode === "signin" ? "on" : ""}">Sign in</button><button data-m="signup" class="${mode === "signup" ? "on" : ""}">Create account</button></div>` : ""}
     <div id="amsg">${msg}</div>
     <form id="af">
-      ${mode === "signup" ? `<div class="f"><label>Full name</label><input name="name" required autocomplete="name"></div>` : ""}
-      ${["signin", "signup", "reset"].includes(mode) ? `<div class="f"><label>Work email</label><input name="email" type="email" required autocomplete="email" value="${esc(authEmail)}"></div>` : ""}
-      ${["confirm", "newpass"].includes(mode) ? `<div class="f"><label>Code from the email sent to ${esc(authEmail)}</label><input name="code" required inputmode="numeric" autocomplete="one-time-code"></div>` : ""}
-      ${["signin", "signup", "newpass"].includes(mode) ? `<div class="f"><label>${mode === "newpass" ? "New password" : "Password"}</label><input name="password" type="password" required minlength="8" autocomplete="${mode === "signin" ? "current-password" : "new-password"}">${mode !== "signin" ? `<div class="hint">At least 8 characters with upper and lower case letters, a number and a symbol.</div>` : ""}</div>` : ""}
+      ${["signin", "reset"].includes(mode) ? `<div class="f"><label>Work email</label><input name="email" type="email" required autocomplete="username" value="${esc(authEmail)}"></div>` : ""}
+      ${mode === "signin" ? `<div class="f"><label>Password</label><input name="password" type="password" required autocomplete="current-password"></div>` : ""}
+      ${mode === "newpw" ? `<p class="hint" style="margin-top:0">Welcome! You signed in with a temporary password. Choose your own to continue.</p><div class="f"><label>New password</label><input name="password" type="password" required minlength="8" autocomplete="new-password">${pwHint}</div><div class="f"><label>Confirm new password</label><input name="password2" type="password" required minlength="8" autocomplete="new-password"></div>` : ""}
+      ${mode === "totp" ? `<p class="hint" style="margin-top:0">Open your authenticator app and enter the 6-digit code for ${esc(APP_NAME)}.</p><div class="f"><label>Code</label><input name="code" required inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code" autofocus></div>` : ""}
+      ${mode === "newpass" ? `<div class="f"><label>Code from the email sent to ${esc(authEmail)}</label><input name="code" required inputmode="numeric" autocomplete="one-time-code"></div><div class="f"><label>New password</label><input name="password" type="password" required minlength="8" autocomplete="new-password">${pwHint}</div>` : ""}
       <button class="btn primary" id="asub">${buttons[mode]}</button>
     </form>
-    ${mode === "signin" ? `<button class="link" data-m="reset">Forgot your password?</button>` : ""}
-    ${mode === "confirm" ? `<button class="link" id="resend">Send a new code</button>` : ""}
-    ${["reset", "confirm", "newpass"].includes(mode) ? `<br><button class="link" data-m="signin">Back to sign in</button>` : ""}
+    ${mode === "signin" ? `<button class="link" data-m="reset">Forgot your password?</button><p class="hint" style="margin-top:16px">Accounts are created by your manager. No account? Ask them to invite you.</p>` : ""}
+    ${mode !== "signin" ? `<br><button class="link" data-m="signin">Back to sign in</button>` : ""}
   </div></div>`;
   document.querySelectorAll("[data-m]").forEach(b => b.onclick = () => showAuth(b.dataset.m));
   const say = (t, ok) => $("#amsg").innerHTML = `<div class="msg ${ok ? "ok" : "err"}">${esc(t)}</div>`;
   const ok = t => `<div class="msg ok">${esc(t)}</div>`;
-  $("#resend")?.addEventListener("click", async () => { try { await resendSignUpCode({ username: authEmail }); say("New code sent.", true); } catch (e) { say(friendly(e)); } });
+  $("#af").querySelector("input")?.focus();
   $("#af").onsubmit = async e => {
     e.preventDefault();
     const fd = Object.fromEntries(new FormData(e.target)); const btn = $("#asub"); btn.disabled = true;
     if (fd.email) authEmail = fd.email.trim().toLowerCase();
     try {
-      if (mode === "signin") {
-        const r = await signIn({ username: authEmail, password: fd.password });
-        if (r.isSignedIn) return boot();
-        if (r.nextStep?.signInStep === "CONFIRM_SIGN_UP") { authPassword = fd.password; await resendSignUpCode({ username: authEmail }); return showAuth("confirm", ok("Your email isn't confirmed yet. We've sent you a new code.")); }
-        say("Another sign-in step is required: " + (r.nextStep?.signInStep || "unknown"));
-      } else if (mode === "signup") {
-        const r = await signUp({ username: authEmail, password: fd.password, options: { userAttributes: { email: authEmail, name: fd.name } } });
-        authPassword = fd.password;
-        if (r.nextStep?.signUpStep === "CONFIRM_SIGN_UP") return showAuth("confirm", ok("We've emailed you a 6-digit code."));
-        await signIn({ username: authEmail, password: authPassword }); authPassword = ""; return boot();
-      } else if (mode === "confirm") {
-        await confirmSignUp({ username: authEmail, confirmationCode: fd.code.trim() });
-        if (authPassword) { await signIn({ username: authEmail, password: authPassword }); authPassword = ""; return boot(); }
-        return showAuth("signin", ok("Email confirmed. Please sign in."));
-      } else if (mode === "reset") {
+      if (mode === "signin") return nextSignInStep(await signIn({ username: authEmail, password: fd.password }));
+      if (mode === "newpw") {
+        if (fd.password !== fd.password2) return say("The two passwords don't match.");
+        return nextSignInStep(await confirmSignIn({ challengeResponse: fd.password }));
+      }
+      if (mode === "totp") return nextSignInStep(await confirmSignIn({ challengeResponse: fd.code.trim() }));
+      if (mode === "reset") {
         await resetPassword({ username: authEmail });
         return showAuth("newpass", ok("If that email has an account, we've sent a reset code."));
-      } else if (mode === "newpass") {
+      }
+      if (mode === "newpass") {
         await confirmResetPassword({ username: authEmail, confirmationCode: fd.code.trim(), newPassword: fd.password });
         return showAuth("signin", ok("Password changed. Please sign in."));
       }
     } catch (err) {
       if (err?.name === "UserAlreadyAuthenticatedException") return boot();
-      say(friendly(err));
+      say(friendlyAuth(err));
     } finally { if (document.body.contains(btn)) btn.disabled = false; }
+  };
+}
+function friendlyAuth(e) {
+  const n = e?.name || "";
+  if (n === "NotAuthorizedException" && /disabled/i.test(e?.message || "")) return "This account has been disabled. Contact your manager.";
+  if (n === "NotAuthorizedException" && /expired/i.test(e?.message || "")) return "Your temporary password has expired. Ask your manager to resend your invite.";
+  if (n === "NotAuthorizedException" || n === "UserNotFoundException") return "Incorrect email or password.";
+  if (n === "CodeMismatchException" || n === "EnableSoftwareTokenMFAException") return "That code isn't right. Check the app and try again.";
+  if (n === "InvalidPasswordException") return e.message;
+  return friendly(e);
+}
+function nextSignInStep(res) {
+  const step = res?.nextStep?.signInStep;
+  if (res?.isSignedIn || step === "DONE") return boot();
+  if (step === "CONFIRM_SIGN_IN_WITH_NEW_PASSWORD_REQUIRED") return showAuth("newpw");
+  if (step === "CONFIRM_SIGN_IN_WITH_TOTP_CODE") return showAuth("totp");
+  if (step === "CONTINUE_SIGN_IN_WITH_TOTP_SETUP") return showMfaSetup(true, res.nextStep.totpSetupDetails);
+  if (step === "RESET_PASSWORD") return showAuth("reset", `<div class="msg err">You need to reset your password.</div>`);
+  showAuth("signin", `<div class="msg err">Unsupported sign-in step: ${esc(step || "unknown")}</div>`);
+}
+
+// Two-step verification setup with an authenticator app (Google Authenticator, Microsoft Authenticator, 1Password…).
+// `duringSignIn` details come from the CONTINUE_SIGN_IN_WITH_TOTP_SETUP step; otherwise we start setup for the signed-in user.
+async function showMfaSetup(required, duringSignIn) {
+  $("#app").innerHTML = `<div class="boot">Preparing two-step verification…</div>`;
+  let details;
+  try { details = duringSignIn || await setUpTOTP(); } catch (e) { $("#app").innerHTML = `<div class="auth"><div class="auth-card"><div class="msg err">${esc(friendlyAuth(e))}</div><button class="btn" id="so">Sign out</button></div></div>`; $("#so").onclick = doSignOut; return; }
+  const uri = details.getSetupUri(APP_NAME, S.me?.email || authEmail).toString();
+  let qr = ""; try { qr = await QRCode.toDataURL(uri, { margin: 1, width: 200 }); } catch (e) { console.warn(e); }
+  $("#app").innerHTML = `<div class="auth"><div class="auth-card">
+    <h1>Set up two-step verification</h1>
+    <p class="sub">${required ? "Manager accounts must use two-step verification." : "Adds a code from your phone to every sign-in."}</p>
+    <ol class="steps"><li>Install an authenticator app (Google Authenticator, Microsoft Authenticator, 1Password…).</li><li>Scan this code with the app.</li><li>Enter the 6-digit code the app shows.</li></ol>
+    <div class="qr">${qr ? `<img src="${qr}" alt="QR code for your authenticator app" width="200" height="200">` : ""}</div>
+    <details class="hint"><summary>Can't scan? Enter this key instead</summary><code class="secret">${esc(details.sharedSecret)}</code></details>
+    <div id="amsg"></div>
+    <form id="af"><div class="f"><label>6-digit code</label><input name="code" required inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code"></div>
+    <button class="btn primary" id="asub">Turn on two-step verification</button></form>
+    <br>${required ? `<button class="link" id="so">Sign out</button>` : `<button class="link" id="later">Not now</button>`}
+  </div></div>`;
+  $("#so")?.addEventListener("click", doSignOut);
+  $("#later")?.addEventListener("click", () => boot());
+  $("#af input").focus();
+  $("#af").onsubmit = async e => {
+    e.preventDefault(); const code = new FormData(e.target).get("code").trim(); const btn = $("#asub"); btn.disabled = true;
+    try {
+      if (duringSignIn) return nextSignInStep(await confirmSignIn({ challengeResponse: code }));
+      await verifyTOTPSetup({ code });
+      await updateMFAPreference({ totp: "PREFERRED" });
+      toast("Two-step verification is on");
+      boot();
+    } catch (err) { $("#amsg").innerHTML = `<div class="msg err">${esc(friendlyAuth(err))}</div>`; btn.disabled = false; }
   };
 }
 
 function showPending() {
-  $("#app").innerHTML = `<div class="auth"><div class="auth-card"><h1>Waiting for approval</h1>
-    <p class="sub">Hi ${esc(S.me.fullName || S.me.email)}, your account is set up. A manager needs to add you to a department before you can see anything.</p>
+  $("#app").innerHTML = `<div class="auth"><div class="auth-card"><h1>No department yet</h1>
+    <p class="sub">Hi ${esc(S.me.fullName || S.me.email)}, you're signed in, but your manager hasn't added you to a department yet.</p>
     <div style="display:flex;gap:8px"><button class="btn primary" id="chk">Check again</button><button class="btn" id="so">Sign out</button></div></div></div>`;
   $("#so").onclick = doSignOut;
   $("#chk").onclick = () => boot(true);
@@ -369,9 +418,12 @@ function render() {
 }
 function bindShell() {
   $("#signout").onclick = doSignOut;
-  $("#editme").onclick = () => modal("Your profile", [{ k: "fullName", label: "Display name", req: true }], { fullName: S.me.fullName }, async o => {
+  $("#editme").onclick = () => modal("Your profile", [
+    { k: "fullName", label: "Display name", req: true },
+    { k: "_mfa", type: "info", label: "Two-step verification", html: S.me.mfa ? `<span class="pill st-resolved">On</span> <span class="hint">You'll be asked for a code from your authenticator app at each sign-in.</span>` : `<span class="pill">Off</span> <span class="hint">Recommended: protects your account if your password leaks.</span>` },
+  ], { fullName: S.me.fullName }, async o => {
     const r = await upd("profiles", S.me.id, { fullName: o.fullName }); if (r) { S.me.fullName = r.fullName; render(); toast("Profile updated"); }
-  });
+  }, S.me.mfa ? null : { label: "Set up two-step verification", plain: true, onClick: () => { closeModal(); showMfaSetup(false); return false; } });
 }
 
 /* ---------- views ---------- */
@@ -498,18 +550,24 @@ function vDepartments() {
 
 function vTeam() {
   if (!S.staff) return `<div class="head"><h1>Team & access</h1></div><div class="panel"><div class="empty">Loading team…</div></div>`;
-  const list = [...S.staff].sort((a, b) => (a.role === "pending" ? -1 : 0) - (b.role === "pending" ? -1 : 0) || (a.name || a.email || "").localeCompare(b.name || b.email || ""));
+  const order = u => u.owner ? 0 : u.role === "pending" ? 1 : u.status === "FORCE_CHANGE_PASSWORD" ? 2 : 3;
+  const list = [...S.staff].sort((a, b) => order(a) - order(b) || (a.name || a.email || "").localeCompare(b.name || b.email || ""));
   const ds = depts();
-  return `<div class="head"><div><h1>Team & access</h1><div class="sub">Tick the departments each person can see. Managers see everything. Enforced by AWS, not just the screen.</div></div><span class="spacer"></span><button class="btn" id="reloadStaff">Refresh</button></div>
-  ${ds.length ? "" : `<div class="msg ok">Create a department first under <a href="#departments">Departments</a>, then give people access here.</div>`}
-  <div class="panel"><table><thead><tr><th>Person</th><th>Status</th><th>Manager</th><th>Departments</th><th></th></tr></thead><tbody>
-  ${list.map(u => `<tr data-user="${esc(u.username)}"><td><span class="b">${esc(u.name || pname(u.id) || "—")}</span>${u.id === S.me.id ? ` <span class="hint">(you)</span>` : ""}<div class="hint">${esc(u.email || "")}</div></td>
-    <td>${u.role === "pending" ? `<span class="pill r-pending">Pending</span>` : u.status === "CONFIRMED" ? "Active" : esc(u.status === "UNCONFIRMED" ? "Email not confirmed" : (u.status || ""))}</td>
-    <td><label class="chk"><input type="checkbox" class="u-mgr" ${u.manager ? "checked" : ""}> Manager</label></td>
+  const status = u => !u.enabled ? `<span class="pill sg-lost">Disabled</span>` : u.status === "FORCE_CHANGE_PASSWORD" ? `<span class="pill r-pending">Invited</span>` : `<span class="pill st-resolved">Active</span>`;
+  return `<div class="head"><div><h1>Team & access</h1><div class="sub">Only people you add here can sign in. Tick the departments each person can see; managers see everything.</div></div><span class="spacer"></span>
+    <button class="btn" id="reloadStaff">Refresh</button><button class="btn primary" data-act="invite">+ Add person</button></div>
+  ${ds.length ? "" : `<div class="msg ok">Tip: create your departments first under <a href="#departments">Departments</a>, then add people to them.</div>`}
+  <div class="panel"><table><thead><tr><th>Person</th><th>Status</th><th>2-step</th><th>Manager</th><th>Departments</th><th></th></tr></thead><tbody>
+  ${list.map(u => `<tr data-user="${esc(u.username)}"><td><span class="b">${esc(u.name || pname(u.id) || "—")}</span>${u.owner ? ` <span class="pill r-admin">Owner</span>` : ""}${u.id === S.me.id ? ` <span class="hint">(you)</span>` : ""}<div class="hint">${esc(u.email || "")}</div></td>
+    <td>${status(u)}${u.role === "pending" && u.enabled ? `<div class="hint">No department yet</div>` : ""}</td>
+    <td>${u.mfa ? "✓ On" : `<span class="hint">Off</span>`}</td>
+    <td><label class="chk"><input type="checkbox" class="u-mgr" ${u.manager ? "checked" : ""} ${u.owner ? "disabled" : ""}> Manager</label></td>
     <td><div class="chips">${ds.map(d => `<label class="chip" style="--c:${esc(d.color || COLORS[0])}"><input type="checkbox" class="u-dept" value="${esc(d.groupName)}" ${(u.departments || []).includes(d.groupName) ? "checked" : ""}> ${esc(d.name)}</label>`).join("") || `<span class="hint">No departments yet</span>`}</div></td>
-    <td style="text-align:right"><button class="btn sm primary u-save" disabled>Save</button></td></tr>`).join("")}
+    <td class="u-actions"><button class="btn sm primary u-save" disabled>Save</button>
+      ${u.status === "FORCE_CHANGE_PASSWORD" ? `<button class="btn sm u-resend" title="Email a new temporary password">Resend invite</button>` : ""}
+      ${!u.owner && u.id !== S.me.id ? `<button class="btn sm u-toggle">${u.enabled ? "Disable" : "Enable"}</button><button class="btn sm danger u-remove">Remove</button>` : ""}</td></tr>`).join("")}
   </tbody></table></div>
-  <p class="hint">New people sign up on the login page and appear here as <b>Pending</b>. They get access as soon as they sign in again or click "Check again".</p>`;
+  <p class="hint">New people get an email with a temporary password. They choose their own password at first sign-in. Access changes apply the next time they sign in or refresh.</p>`;
 }
 
 /* ---------- main bindings ---------- */
@@ -517,7 +575,7 @@ function bindMain() {
   const m = $("#main");
   const acts = {
     newTicket: () => chooseDept(d => formTicket(null, d)), newInDept: () => formTicket(null, dept(viewDept)),
-    newContact: () => formContact(), newCompany: () => formCompany(), newDept: () => formDept(),
+    newContact: () => formContact(), newCompany: () => formCompany(), newDept: () => formDept(), invite: () => formInvite(),
     exportBoard, exportContacts,
   };
   m.querySelectorAll("[data-act]").forEach(b => b.onclick = () => acts[b.dataset.act]());
@@ -546,25 +604,54 @@ function bindMain() {
   // team & access
   $("#reloadStaff")?.addEventListener("click", () => { S.staff = null; render(); loadStaff(); });
   m.querySelectorAll("tr[data-user]").forEach(tr => {
-    const save = tr.querySelector(".u-save");
+    const save = tr.querySelector(".u-save"), username = tr.dataset.user, u = S.staff.find(x => x.username === username);
+    const busy = async (btn, label, fn) => { const old = btn.textContent; btn.disabled = true; btn.textContent = label; try { await fn(); } catch (e) { fail(e); } finally { btn.textContent = old; btn.disabled = false; } await loadStaff(); };
     tr.querySelectorAll("input").forEach(i => i.onchange = () => save.disabled = false);
-    save.onclick = async () => {
-      save.disabled = true; save.textContent = "Saving…";
-      const username = tr.dataset.user, u = S.staff.find(x => x.username === username);
+    save.onclick = () => busy(save, "Saving…", async () => {
       const manager = tr.querySelector(".u-mgr").checked;
       const chosen = [...tr.querySelectorAll(".u-dept:checked")].map(i => i.value);
-      try {
-        await callAdmin("setUserAccess", { username, manager, departments: chosen });
-        // keep each department's member list in step (used for assignee pickers)
-        for (const d of S.departments) {
-          const should = chosen.includes(d.groupName), ids = d.memberIds || [], is = ids.includes(u.id);
-          if (should !== is) await upd("departments", d.id, { memberIds: should ? [...ids, u.id] : ids.filter(x => x !== u.id) });
-        }
-        toast(`Access updated for ${u.name || u.email}`);
-        if (u.id === S.me.id) return boot(true);
-      } catch (e) { fail(e); }
-      await loadStaff();
+      await callAdmin("setUserAccess", { username, manager, departments: chosen });
+      await syncMembership(u.id, chosen);
+      toast(`Access updated for ${u.name || u.email}`);
+      if (u.id === S.me.id) boot(true);
+    });
+    const resend = tr.querySelector(".u-resend");
+    if (resend) resend.onclick = () => busy(resend, "Sending…", async () => { await callAdmin("resendInvite", { username }); toast(`New invite emailed to ${u.email}`); });
+    const toggle = tr.querySelector(".u-toggle");
+    if (toggle) toggle.onclick = () => busy(toggle, "…", async () => { await callAdmin("setUserEnabled", { username, enabled: !u.enabled }); toast(`${u.name || u.email} ${u.enabled ? "disabled: they can no longer sign in" : "enabled"}`); });
+    const remove = tr.querySelector(".u-remove");
+    if (remove) remove.onclick = () => {
+      if (!remove.classList.contains("armed")) { remove.classList.add("armed"); remove.textContent = "Click again to remove"; setTimeout(() => { if (document.body.contains(remove)) { remove.classList.remove("armed"); remove.textContent = "Remove"; } }, 3000); return; }
+      busy(remove, "Removing…", async () => { await callAdmin("removeUser", { username }); await syncMembership(u.id, []); toast(`${u.name || u.email} removed`); });
     };
+  });
+}
+
+// Keep each department's member list in step with Cognito (used for assignee pickers).
+async function syncMembership(userId, groupNames) {
+  if (!userId) return;
+  for (const d of S.departments) {
+    const should = groupNames.includes(d.groupName), ids = d.memberIds || [], is = ids.includes(userId);
+    if (should !== is) await upd("departments", d.id, { memberIds: should ? [...ids, userId] : ids.filter(x => x !== userId) });
+  }
+}
+
+function formInvite() {
+  const ds = depts();
+  modal("Add a person", [
+    { k: "name", label: "Full name", req: true, half: true },
+    { k: "email", label: "Work email", type: "email", req: true, half: true },
+    { k: "departments", label: "Departments they can see", type: "checks", opts: ds.map(d => [d.groupName, d.name]), hint: ds.length ? "" : "No departments yet. You can add them to departments later." },
+    { k: "manager", label: "Access level", type: "checkbox", text: "Manager: sees every department and can manage the team" },
+  ], {}, async o => {
+    const departments = o.departments || [], manager = !!o.manager;
+    try {
+      await callAdmin("inviteUser", { email: o.email, name: o.name, manager, departments });
+    } catch (e) { fail(e); return false; }
+    await loadStaff();
+    const u = (S.staff || []).find(x => (x.email || "").toLowerCase() === o.email.toLowerCase());
+    if (u) await syncMembership(u.id, departments);
+    toast(`Invite emailed to ${o.email}`);
   });
 }
 
@@ -592,21 +679,26 @@ function modal(title, fields, rec, onSave, extra) {
     const v = rec[f.k] ?? f.def ?? "";
     if (f.type === "select") return `<select name="${f.k}" ${f.disabled ? "disabled" : ""}>${f.opts.map(o => Array.isArray(o) ? o : [o, o]).map(([val, l]) => `<option value="${esc(val)}" ${String(val) === String(v) ? "selected" : ""}>${esc(l)}</option>`).join("")}</select>`;
     if (f.type === "textarea") return `<textarea name="${f.k}">${esc(v)}</textarea>`;
+    if (f.type === "info") return `<div>${f.html}</div>`;
+    if (f.type === "checkbox") return `<label class="chk"><input type="checkbox" name="${f.k}" ${v ? "checked" : ""}> ${esc(f.text || "")}</label>`;
+    if (f.type === "checks") return `<div class="chips">${f.opts.map(([val, l]) => `<label class="chip"><input type="checkbox" name="${f.k}" value="${esc(val)}" ${(v || []).includes(val) ? "checked" : ""}> ${esc(l)}</label>`).join("") || ""}</div>`;
     if (f.type === "colors") return `<div class="swatches">${COLORS.map(c => `<label style="--c:${c}"><input type="radio" name="${f.k}" value="${c}" ${c === (v || COLORS[0]) ? "checked" : ""}><span></span></label>`).join("")}</div>`;
     return `<input name="${f.k}" type="${f.type || "text"}" value="${esc(v)}" ${f.req ? "required" : ""} ${f.max ? `maxlength="${f.max}"` : ""} ${f.type === "number" ? 'min="0" step="0.01"' : ""} ${f.list ? `list="dl-${f.k}"` : ""}>${f.list ? `<datalist id="dl-${f.k}">${f.list.map(x => `<option value="${esc(x)}">`).join("")}</datalist>` : ""}`;
   };
   const block = f => `<div class="f" ${f.showIf ? `data-show="${f.showIf}"` : ""}><label>${f.label}</label>${input(f)}${f.hint ? `<div class="hint">${f.hint}</div>` : ""}</div>`;
   const rows = []; for (let i = 0; i < fields.length; i++) { const f = fields[i]; if (f.half && fields[i + 1]?.half) { rows.push(`<div class="frow">${block(f)}${block(fields[++i])}</div>`); } else rows.push(block(f)); }
-  md.innerHTML = `<form><h2>${title}</h2>${rows.join("")}<div class="mfoot">${extra ? `<button type="button" class="btn danger" id="mextra">${extra.label}</button><span class="spacer"></span>` : ""}<button type="button" class="btn" id="mcancel">Cancel</button><button class="btn primary" id="msave">Save</button></div></form>`;
+  md.innerHTML = `<form><h2>${title}</h2>${rows.join("")}<div class="mfoot">${extra ? `<button type="button" class="btn ${extra.plain ? "" : "danger"}" id="mextra">${extra.label}</button><span class="spacer"></span>` : ""}<button type="button" class="btn" id="mcancel">Cancel</button><button class="btn primary" id="msave">Save</button></div></form>`;
   md.classList.add("on"); $("#mscrim").classList.add("on");
   const form = md.querySelector("form");
   const sync = () => md.querySelectorAll("[data-show]").forEach(el => { const [k, val] = el.dataset.show.split("="); el.style.display = form.elements[k]?.value === val ? "" : "none"; });
   form.addEventListener("change", sync); sync();
   md.querySelector("input,select,textarea")?.focus();
   md.querySelector("#mcancel").onclick = closeModal;
-  if (extra) { const b = $("#mextra"); b.onclick = async () => { if (!b.classList.contains("armed")) { b.classList.add("armed"); b.textContent = "Click again to confirm"; return; } if (await extra.onClick() !== false) closeModal(); }; }
+  if (extra) { const b = $("#mextra"); b.onclick = async () => { if (extra.plain) { await extra.onClick(); return; } if (!b.classList.contains("armed")) { b.classList.add("armed"); b.textContent = "Click again to confirm"; return; } if (await extra.onClick() !== false) closeModal(); }; }
   form.onsubmit = async e => {
-    e.preventDefault(); const o = {}; new FormData(form).forEach((v, k) => o[k] = typeof v === "string" ? v.trim() : v);
+    e.preventDefault(); const o = {}; const fd = new FormData(form);
+    fields.forEach(f => { if (f.type === "checks") o[f.k] = fd.getAll(f.k).map(String); else if (f.type === "checkbox") o[f.k] = fd.has(f.k); });
+    fd.forEach((v, k) => { const f = fields.find(x => x.k === k); if (!f || (f.type !== "checks" && f.type !== "checkbox")) o[k] = typeof v === "string" ? v.trim() : v; });
     const b = $("#msave"); b.disabled = true; const ok = await onSave(o); b.disabled = false; if (ok !== false) closeModal();
   };
 }

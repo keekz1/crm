@@ -176,3 +176,12 @@ tr.click{cursor:pointer} tr.click:hover td{background:#fafbff}
 .swatches span{display:block;width:26px;height:26px;border-radius:50%;background:var(--c);border:3px solid #fff;box-shadow:0 0 0 1px var(--line)}
 .swatches input:checked+span{box-shadow:0 0 0 2px var(--c)}
 .mfoot .spacer{flex:1}
+
+/* sign-in & two-step */
+.steps{padding-left:20px;line-height:1.7;margin:0 0 12px;color:#374151}
+.qr{display:flex;justify-content:center;margin:8px 0 12px}
+.qr img{border:1px solid var(--line);border-radius:8px}
+.secret{display:block;margin-top:6px;word-break:break-all;background:#f1f2f4;padding:8px;border-radius:6px;font-size:13px;user-select:all}
+details.hint{margin-bottom:14px}
+.u-actions{text-align:right;white-space:nowrap}
+.u-actions .btn{margin-left:4px}

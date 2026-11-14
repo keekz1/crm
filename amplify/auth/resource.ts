@@ -1,19 +1,37 @@
 import { defineAuth } from "@aws-amplify/backend";
-import { postConfirmation } from "./post-confirmation/resource";
 import { adminUsers } from "../data/admin-users/resource";
+import { APP_URL } from "../config";
 
 /**
+ * Invite-only sign-in (self sign-up is switched off in backend.ts).
+ *
  * Cognito groups:
- *   MANAGERS     - see every department, create departments, manage the team
+ *   MANAGERS     - see every department, create departments, add/remove people
  *   STAFF        - any approved user (gives access to the shared customer directory)
- *   dept-xxxxxx  - one group per department, created by managers from the app.
- *                  Tickets carry their department's group name and AppSync only
- *                  returns them to members of that group (or MANAGERS).
- * Users in no group are "pending" and can't read any CRM data.
+ *   dept-xxxxxx  - one group per department, created by managers from the app
+ *
+ * Two-step verification uses an authenticator app (TOTP). It's required for managers
+ * (enforced by the app and by the admin function) and optional for everyone else.
  */
 export const auth = defineAuth({
   loginWith: {
-    email: true,
+    email: {
+      verificationEmailStyle: "CODE",
+      verificationEmailSubject: "Your CoreCRM verification code",
+      verificationEmailBody: (createCode) => `Your CoreCRM verification code is ${createCode()}`,
+      userInvitation: {
+        emailSubject: "You've been invited to CoreCRM",
+        emailBody: (user, code) =>
+          `Hello,<br><br>You've been given access to CoreCRM.<br><br>` +
+          (APP_URL ? `Sign in at: ${APP_URL}<br>` : "") +
+          `Email: ${user()}<br>Temporary password: ${code()}<br><br>` +
+          `You'll be asked to choose your own password when you first sign in. This temporary password expires in 7 days.`,
+      },
+    },
+  },
+  multifactor: {
+    mode: "OPTIONAL",
+    totp: true,
   },
   userAttributes: {
     fullname: {
@@ -22,13 +40,21 @@ export const auth = defineAuth({
     },
   },
   groups: ["MANAGERS", "STAFF"],
-  triggers: {
-    postConfirmation,
-  },
   access: (allow) => [
-    allow.resource(postConfirmation).to(["addUserToGroup", "listUsersInGroup"]),
     allow
       .resource(adminUsers)
-      .to(["listUsers", "listGroupsForUser", "listUsersInGroup", "addUserToGroup", "removeUserFromGroup", "manageGroups"]),
+      .to([
+        "listUsers",
+        "getUser",
+        "listGroupsForUser",
+        "listUsersInGroup",
+        "addUserToGroup",
+        "removeUserFromGroup",
+        "manageGroups",
+        "createUser",
+        "deleteUser",
+        "disableUser",
+        "enableUser",
+      ]),
   ],
 });

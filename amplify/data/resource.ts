@@ -9,6 +9,7 @@ import { adminUsers } from "./admin-users/resource";
  *   Company, Contact  -> shared customer directory for all approved staff; only MANAGERS delete.
  *   Profile           -> each user manages their own; staff can read names.
  * Users in no group ("pending") can only read their own Profile.
+ * Accounts are invite-only: managers add people from the app (see admin-users).
  */
 const schema = a.schema({
   Profile: a
@@ -115,6 +116,34 @@ const schema = a.schema({
   // Manager-only team administration (Cognito groups)
   listStaff: a
     .query()
+    .returns(a.json())
+    .authorization((allow) => [allow.groups(["MANAGERS"])])
+    .handler(a.handler.function(adminUsers)),
+
+  inviteUser: a
+    .mutation()
+    .arguments({ email: a.string().required(), name: a.string(), manager: a.boolean().required(), departments: a.string().array() })
+    .returns(a.json())
+    .authorization((allow) => [allow.groups(["MANAGERS"])])
+    .handler(a.handler.function(adminUsers)),
+
+  resendInvite: a
+    .mutation()
+    .arguments({ username: a.string().required() })
+    .returns(a.json())
+    .authorization((allow) => [allow.groups(["MANAGERS"])])
+    .handler(a.handler.function(adminUsers)),
+
+  setUserEnabled: a
+    .mutation()
+    .arguments({ username: a.string().required(), enabled: a.boolean().required() })
+    .returns(a.json())
+    .authorization((allow) => [allow.groups(["MANAGERS"])])
+    .handler(a.handler.function(adminUsers)),
+
+  removeUser: a
+    .mutation()
+    .arguments({ username: a.string().required() })
     .returns(a.json())
     .authorization((allow) => [allow.groups(["MANAGERS"])])
     .handler(a.handler.function(adminUsers)),
