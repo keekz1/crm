@@ -87,6 +87,26 @@ const SHOTS = __dirname + '/screenshots';
   await page.waitForSelector('#drawer.on >> text=IT-1001'); await page.click('#dclose'); await page.waitForTimeout(250);
   ok(true, 'manager created and assigned tickets in Sales and IT');
 
+  // ---- bulk delete (manager)
+  const mkIT = async title => { await page.click('text=+ New ticket'); await page.fill('#modal input[name=title]', title); await page.click('#msave'); await page.waitForSelector(`#drawer.on >> text=${title}`); };
+  await mkIT('Old ticket A'); await page.selectOption('#tstatus', 'resolved'); await page.waitForSelector('#drawer >> text=Status: Open → Resolved'); await page.click('#dclose'); await page.waitForTimeout(250);
+  await mkIT('Old ticket B'); await page.selectOption('#tstatus', 'closed'); await page.waitForSelector('#drawer >> text=Status: Open → Closed'); await page.click('#dclose'); await page.waitForTimeout(250);
+  await mkIT('Still open C'); await page.click('#dclose'); await page.waitForTimeout(250);
+  await page.selectOption('#f-age', '0'); await page.waitForTimeout(200);
+  const shown = await page.$$eval('tbody tr', rs => rs.map(r => r.innerText));
+  ok(shown.length === 2 && shown.every(t => /Old ticket/.test(t)), 'age filter shows only resolved/closed tickets');
+  await page.check('.sel-all'); await page.waitForSelector('#bulkbar >> text=2 selected');
+  await shot('03b-bulk');
+  await page.click('#bulkdel'); await page.waitForSelector('#bulkdel >> text=Click again'); await page.click('#bulkdel');
+  await page.waitForSelector('.toast >> text=Deleted 2 tickets'); await page.selectOption('#f-age', ''); await page.waitForTimeout(200);
+  ok(!(await page.isVisible('td >> text=Old ticket')) && await page.isVisible('td >> text=Still open C') && await page.isVisible("td >> text=Laptop won't boot"), 'bulk delete removed only the selected tickets');
+  await page.click('td >> text=Still open C'); await page.waitForSelector('#drawer.on'); await page.click('#ddel'); await page.click('#ddel'); await page.waitForSelector('.toast >> text=Deleted');
+  await nav('Sales'); await page.click('text=+ New deal'); await page.fill('#modal input[name=title]', 'Lost deal'); await page.selectOption('#modal select[name=stage]', 'lost'); await page.click('#msave');
+  await page.waitForSelector('#drawer.on >> text=SAL-1002'); await page.click('#dclose'); await page.waitForTimeout(250);
+  await page.check('.card:has-text("Lost deal") .sel'); await page.waitForSelector('#bulkbar >> text=1 selected');
+  await page.click('#bulkdel'); await page.click('#bulkdel'); await page.waitForSelector('.toast >> text=Deleted 1 ticket');
+  ok(!(await page.isVisible('.card:has-text("Lost deal")')) && await page.isVisible('.card:has-text("Website rebuild")'), 'bulk delete from the pipeline board');
+
   // ---- owner signs in again: password + authenticator code
   await signOutIfIn(); await password(OWNER, OWNER_PW); await page.waitForSelector('text=Two-step verification');
   ok(true, 'owner: second sign-in asks for authenticator code');
@@ -100,6 +120,9 @@ const SHOTS = __dirname + '/screenshots';
   ok(await page.isVisible('nav >> text="Sales"') && !(await page.isVisible('nav >> text="IT Support"')) && !(await page.isVisible('nav >> text="Team & access"')), 'Sam: only Sales, no Manage section');
   const samView = await api(async c => (await c.models.Ticket.list()).data.map(x => x.refCode).join(','));
   ok(samView === 'SAL-1001', 'Sam: API returns only Sales tickets (got ' + samView + ')');
+  await nav('Sales'); ok((await page.$$('.sel, .sel-all')).length === 0, 'Sam: no bulk-delete checkboxes for members');
+  const samDel = await api(async c => { const t = (await c.models.Ticket.list()).data[0]; return (await c.models.Ticket.delete({ id: t.id })).errors?.[0]?.errorType; });
+  ok(samDel === 'Unauthorized', 'Sam: API refuses ticket deletion by members');
   const samAdmin = await api(async c => (await c.queries.listStaff()).errors?.[0]?.errorType);
   ok(samAdmin === 'Unauthorized', 'Sam: cannot call team admin');
   await page.click('#editme'); await page.waitForSelector('#modal.on >> text=Two-step verification');

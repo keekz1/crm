@@ -185,3 +185,18 @@ tr.click{cursor:pointer} tr.click:hover td{background:#fafbff}
 details.hint{margin-bottom:14px}
 .u-actions{text-align:right;white-space:nowrap}
 .u-actions .btn{margin-left:4px}
+
+/* bulk delete */
+.selcell{width:34px;padding-right:0}
+.selcell input,.card .sel,.col-h .sel-all{cursor:pointer;width:15px;height:15px;accent-color:var(--bad)}
+.card .sel{margin:0 6px 0 0;vertical-align:-2px}
+.col-h{gap:6px;align-items:center}
+.col-h .col-t{flex:1}
+tr.picked td{background:#fff5f5}
+.card.picked{border-color:var(--bad);background:#fff5f5}
+.bulkbar{position:sticky;bottom:12px;margin-top:16px;display:flex;align-items:center;gap:10px;background:var(--ink);color:#fff;padding:10px 14px;border-radius:10px;box-shadow:0 8px 24px rgba(0,0,0,.2);z-index:5}
+.bulkbar .hint{color:#c9ced8}
+.bulkbar .hint.warn{color:#fca5a5}
+.bulkbar .btn{background:#232a36;color:#fff;border-color:#2b3341}
+.bulkbar .btn.danger{background:var(--bad);border-color:var(--bad);color:#fff}
+.bulkbar .btn.danger.armed{background:#7f1d1d}

@@ -15,6 +15,8 @@ Each department is one of two types:
 | **Support queue** | Ticket list with filters | Priority, status, SLA timer (Urgent 4h · High 8h · Normal 24h · Low 72h), category, assignee |
 | **Sales pipeline** | Drag-and-drop stages | Deal value, stage (New lead → … → Won / Lost), owner, expected close, lead source |
 
+**Old tickets** are never deleted automatically. Resolved/closed tickets drop out of the default *Active* view but stay searchable. Managers can **bulk delete**: on any department board, use the *Closed* filter (e.g. "Closed 1+ year ago"), tick tickets or "select all", then click *Delete* twice to confirm. Each ticket's activity history is deleted with it. Members can't delete tickets, and AppSync refuses it.
+
 Tickets are numbered per department with a prefix you choose (`IT-1001`, `SAL-1001`, `ACC-1001`).
 
 ## How the separation is enforced

@@ -32,7 +32,9 @@ let client = null;
 const S = { user: null, me: null, profiles: [], companies: [], contacts: [], departments: [], tickets: [], staff: null };
 let view = "dashboard", viewDept = null, openRec = null, activity = [], authEmail = "";
 const F = { board: {}, contacts: { q: "", company: "" }, companies: { q: "" } };
-const boardF = id => F.board[id] || (F.board[id] = { q: "", status: "active", priority: "", assignee: "", owner: "", mine: false });
+const boardF = id => F.board[id] || (F.board[id] = { q: "", status: "active", priority: "", assignee: "", owner: "", mine: false, age: "" });
+const selected = new Set(); // ticket ids ticked for bulk delete (managers only)
+const AGES = [["", "Any age"], ["0", "Closed: any time"], ["30", "Closed 30+ days ago"], ["90", "Closed 90+ days ago"], ["180", "Closed 6+ months ago"], ["365", "Closed 1+ year ago"]];
 
 /* ---------- helpers ---------- */
 const $ = s => document.querySelector(s);
@@ -62,6 +64,8 @@ const roleLabel = () => isManager() ? "Manager" : isStaff() ? "Team member" : "P
 const kindOf = t => deptOf(t)?.kind || (t.stage ? "pipeline" : "support");
 const isOpen = t => kindOf(t) === "pipeline" ? !["won", "lost"].includes(t.stage) : !["resolved", "closed"].includes(t.status);
 const isOverdue = t => kindOf(t) === "support" && isOpen(t) && t.slaDue && Date.now() > ts(t.slaDue);
+const closedOn = t => kindOf(t) === "pipeline" ? t.closedAt : t.resolvedAt;
+const closedFor = (t, days) => !isOpen(t) && closedOn(t) && Date.now() - ts(closedOn(t)) >= Number(days) * 864e5;
 const refLabel = t => t.refCode || `${deptOf(t)?.code || "T"}-${t.ref ?? "?"}`;
 const prioRank = p => { const i = PRIOS.findIndex(x => x[0] === p); return i < 0 ? 9 : i; };
 const ticketsIn = d => S.tickets.filter(t => t.departmentId === d.id);
@@ -110,6 +114,7 @@ async function loadAll() {
 }
 async function refreshQuietly() {
   try { const results = await Promise.all(TABLES.map(fetchAll)); TABLES.forEach((t, i) => S[t] = results[i]); } catch (e) { console.warn("refresh", e); return; }
+  for (const id of [...selected]) if (!byId(S.tickets, id)) selected.delete(id);
   render(); if (openRec) refreshDrawer(true);
 }
 function putLocal(table, row) { const L = S[table]; const i = L.findIndex(x => x.id === row.id); i >= 0 ? L[i] = row : L.push(row); }
@@ -253,7 +258,7 @@ async function ensureProfile() {
 async function doSignOut() { try { await signOut(); } catch (e) { console.error(e); } boot(); }
 
 // Keep data fresh (every 30s) and pick up access changes made by a manager (every 5 min).
-setInterval(() => { if (S.me && isStaff() && document.visibilityState === "visible" && !$("#modal").classList.contains("on")) refreshQuietly(); }, 30000);
+setInterval(() => { if (S.me && isStaff() && document.visibilityState === "visible" && !$("#modal").classList.contains("on") && !$("#bulkdel")?.disabled) refreshQuietly(); }, 30000);
 setInterval(async () => {
   if (!S.me) return;
   try { const g = await readGroups(true); if (g.slice().sort().join() !== groups().slice().sort().join()) boot(); } catch { }
@@ -377,7 +382,7 @@ function showPending() {
 /* ---------- routing & shell ---------- */
 function route() {
   const h = location.hash.slice(1) || "dashboard";
-  viewDept = null;
+  viewDept = null; selected.clear();
   if (h.startsWith("d-") && dept(h.slice(2))) { view = "board"; viewDept = h.slice(2); }
   else if (["dashboard", "mine", "contacts", "companies"].includes(h) || (isManager() && ["departments", "team"].includes(h))) view = h;
   else view = "dashboard";
@@ -429,7 +434,7 @@ function bindShell() {
 /* ---------- views ---------- */
 function ticketRow(t, cols = {}) {
   const d = deptOf(t), pipe = kindOf(t) === "pipeline";
-  return `<tr class="click" data-open="tickets:${t.id}"><td class="id">${esc(refLabel(t))}</td>
+  return `<tr class="click ${selected.has(t.id) ? "picked" : ""}" data-open="tickets:${t.id}">${cols.select ? `<td class="selcell"><input type="checkbox" class="sel" data-id="${t.id}" ${selected.has(t.id) ? "checked" : ""} aria-label="Select ${esc(refLabel(t))}"></td>` : ""}<td class="id">${esc(refLabel(t))}</td>
     ${cols.dept ? `<td>${deptTag(d)}</td>` : ""}
     <td><span class="b">${esc(t.title)}</span><div class="hint">${esc(contact(t.contactId)?.fullName || company(t.companyId)?.name || "")}</div></td>
     <td>${pipe ? `<span class="pill ${t.stage === "won" ? "sg-won" : t.stage === "lost" ? "sg-lost" : ""}">${label(STAGES, t.stage)}</span>` : `<span class="pill st-${t.status}">${label(STATUSES, t.status)}</span>`}</td>
@@ -438,7 +443,7 @@ function ticketRow(t, cols = {}) {
     <td>${pipe ? (t.expectedClose ? "Close " + fmtDate(t.expectedClose) : "—") : !isOpen(t) ? "—" : isOverdue(t) ? `<span class="overdue">Overdue</span>` : "due in " + until(t.slaDue)}</td></tr>`;
 }
 const ticketTable = (list, cols, empty) => list.length
-  ? `<table><thead><tr><th>Ref</th>${cols.dept ? "<th>Department</th>" : ""}<th>Title</th><th>Status</th><th>Priority / value</th>${cols.assignee ? "<th>Assignee</th>" : ""}<th>Due</th></tr></thead><tbody>${list.map(t => ticketRow(t, cols)).join("")}</tbody></table>`
+  ? `<table><thead><tr>${cols.select ? `<th class="selcell"><input type="checkbox" class="sel-all" data-ids="${list.map(t => t.id).join(",")}" ${list.length && list.every(t => selected.has(t.id)) ? "checked" : ""} aria-label="Select all"></th>` : ""}<th>Ref</th>${cols.dept ? "<th>Department</th>" : ""}<th>Title</th><th>Status</th><th>Priority / value</th>${cols.assignee ? "<th>Assignee</th>" : ""}<th>Due</th></tr></thead><tbody>${list.map(t => ticketRow(t, cols)).join("")}</tbody></table>`
   : `<div class="empty">${empty}</div>`;
 const sortByUrgency = list => [...list].sort((a, b) => (isOverdue(b) - isOverdue(a)) || (isOpen(b) - isOpen(a)) || (prioRank(a.priority) - prioRank(b.priority)) || ts(a.slaDue || a.expectedClose || a.createdAt) - ts(b.slaDue || b.expectedClose || b.createdAt));
 
@@ -485,26 +490,55 @@ function vBoard(d) {
     <button class="btn" data-act="exportBoard">Export CSV</button>
     <button class="btn primary" data-act="newInDept">+ ${d.kind === "pipeline" ? "New deal" : "New ticket"}</button></div>`;
   if (d.kind === "pipeline") {
-    const list = ticketsIn(d).filter(t => match(t) && (!f.owner || t.assigneeId === f.owner) && (!f.mine || t.assigneeId === S.me.id));
-    return head + `<div class="filters">${sel("f-owner", f.owner, [["", "All owners"], ...people.map(p => [p.id, p.fullName || p.email])])}<label class="chk"><input type="checkbox" id="f-mine" ${f.mine ? "checked" : ""}> Mine</label></div>
+    const list = ticketsIn(d).filter(t => match(t) && (!f.owner || t.assigneeId === f.owner) && (!f.mine || t.assigneeId === S.me.id) && (f.age === "" || closedFor(t, f.age)));
+    return head + `<div class="filters">${sel("f-owner", f.owner, [["", "All owners"], ...people.map(p => [p.id, p.fullName || p.email])])}<label class="chk"><input type="checkbox" id="f-mine" ${f.mine ? "checked" : ""}> Mine</label>
+    ${sel("f-age", f.age, AGES)}${f.age !== "" ? `<span class="hint">Showing ${list.length} won/lost deal${list.length === 1 ? "" : "s"}</span>` : ""}</div>
     <div class="board">${STAGES.map(([k, l]) => {
       const c = list.filter(t => t.stage === k).sort((a, b) => ts(b.updatedAt) - ts(a.updatedAt));
-      return `<div class="col" data-stage="${k}"><div class="col-h">${l}<small>${c.length} · ${money(c.reduce((s, t) => s + (+t.value || 0), 0))}</small></div>
-      ${c.map(t => `<div class="card" draggable="true" data-id="${t.id}" data-open="tickets:${t.id}"><div class="id">${esc(refLabel(t))}</div><div class="t">${esc(t.title)}</div>
+      return `<div class="col" data-stage="${k}"><div class="col-h">${isManager() && c.length ? `<input type="checkbox" class="sel-all" data-ids="${c.map(t => t.id).join(",")}" ${c.every(t => selected.has(t.id)) ? "checked" : ""} title="Select all in ${l}" aria-label="Select all in ${l}">` : ""}<span class="col-t">${l}</span><small>${c.length} · ${money(c.reduce((s, t) => s + (+t.value || 0), 0))}</small></div>
+      ${c.map(t => `<div class="card ${selected.has(t.id) ? "picked" : ""}" draggable="true" data-id="${t.id}" data-open="tickets:${t.id}"><div class="id">${isManager() ? `<input type="checkbox" class="sel" data-id="${t.id}" ${selected.has(t.id) ? "checked" : ""} aria-label="Select ${esc(refLabel(t))}">` : ""}${esc(refLabel(t))}</div><div class="t">${esc(t.title)}</div>
         <div class="m"><span>${esc(company(t.companyId)?.name || contact(t.contactId)?.fullName || "")}</span><span class="val">${money(t.value)}</span></div>
         <div class="m" style="margin-top:4px"><span>${t.expectedClose ? "Close " + fmtDate(t.expectedClose) : ""}</span><span>${esc(pname(t.assigneeId))}</span></div></div>`).join("")}</div>`;
-    }).join("")}</div>`;
+    }).join("")}</div>${bulkBar()}`;
   }
   const list = sortByUrgency(ticketsIn(d).filter(t => match(t)
-    && (f.status === "active" ? isOpen(t) : f.status === "overdue" ? isOverdue(t) : !f.status || t.status === f.status)
+    && (f.age !== "" ? closedFor(t, f.age) : f.status === "active" ? isOpen(t) : f.status === "overdue" ? isOverdue(t) : !f.status || t.status === f.status)
     && (!f.priority || t.priority === f.priority)
     && (!f.assignee || (f.assignee === "none" ? !t.assigneeId : f.assignee === "me" ? t.assigneeId === S.me.id : t.assigneeId === f.assignee))));
   return head + `<div class="filters">
-    ${sel("f-status", f.status, [["active", "Active"], ["overdue", "Past SLA"], ["", "All statuses"], ...STATUSES])}
+    ${f.age !== "" ? sel("f-status", "", [["", "Resolved & closed"]]).replace("<select", '<select disabled title="Using the Closed filter"') : sel("f-status", f.status, [["active", "Active"], ["overdue", "Past SLA"], ["", "All statuses"], ...STATUSES])}
     ${sel("f-prio", f.priority, [["", "All priorities"], ...PRIOS])}
     ${sel("f-assignee", f.assignee, [["", "Anyone"], ["me", "Assigned to me"], ["none", "Unassigned"], ...people.map(p => [p.id, p.fullName || p.email])])}
-    <span class="hint">${list.length} ticket${list.length === 1 ? "" : "s"}</span></div>
-  <div class="panel">${ticketTable(list, { assignee: true }, "No tickets match these filters")}</div>`;
+    ${sel("f-age", f.age, AGES)}
+    <span class="hint">${list.length} ticket${list.length === 1 ? "" : "s"}${f.age !== "" ? " (resolved/closed only)" : ""}</span></div>
+  <div class="panel">${ticketTable(list, { assignee: true, select: isManager() }, "No tickets match these filters")}</div>${bulkBar()}`;
+}
+
+function bulkBar() {
+  if (!isManager() || !selected.size) return "";
+  const picked = S.tickets.filter(t => selected.has(t.id)), open = picked.filter(isOpen).length;
+  return `<div class="bulkbar" id="bulkbar"><span class="b">${picked.length} selected</span>${open ? `<span class="hint warn">${open} still open</span>` : ""}
+    <span class="spacer"></span><button class="btn sm" id="bulkclear">Clear selection</button><button class="btn sm danger" id="bulkdel">Delete ${picked.length} ticket${picked.length === 1 ? "" : "s"}</button></div>`;
+}
+
+// Permanently delete many tickets (and their activity history). Managers only; AppSync enforces it too.
+async function bulkDelete(ids, btn) {
+  let done = 0; const failed = [];
+  for (const id of ids) {
+    btn.textContent = `Deleting ${done + 1} of ${ids.length}…`;
+    try {
+      const res = await client.models.Ticket.delete({ id });
+      const e = firstErr(res); if (e) throw e;
+      done++;
+    } catch (e) { console.error(e); failed.push(id); }
+  }
+  const gone = new Set(ids.filter(id => !failed.includes(id)));
+  S.tickets = S.tickets.filter(t => !gone.has(t.id));
+  selected.clear(); failed.forEach(id => selected.add(id));
+  render();
+  toast(failed.length ? `Deleted ${done}; ${failed.length} couldn't be deleted` : `Deleted ${done} ticket${done === 1 ? "" : "s"}`, failed.length > 0);
+  // tidy up their activity history in the background
+  listAll("TicketActivity").then(rows => rows.filter(a => gone.has(a.ticketId)).forEach(a => client.models.TicketActivity.delete({ id: a.id }))).catch(e => console.warn(e));
 }
 
 function filteredContacts() {
@@ -585,9 +619,21 @@ function bindMain() {
   if (viewDept) {
     const f = boardF(viewDept);
     on("f-q", v => f.q = v); on("f-status", v => f.status = v, "change"); on("f-prio", v => f.priority = v, "change"); on("f-assignee", v => f.assignee = v, "change");
-    on("f-owner", v => f.owner = v, "change"); on("f-mine", v => f.mine = v, "change");
+    on("f-owner", v => f.owner = v, "change"); on("f-mine", v => f.mine = v, "change"); on("f-age", v => { f.age = v; selected.clear(); }, "change");
   }
   on("f-cq", v => F.contacts.q = v); on("f-cc", v => F.contacts.company = v, "change"); on("f-oq", v => F.companies.q = v);
+
+  // bulk selection (managers)
+  m.querySelectorAll(".sel, .sel-all, .selcell").forEach(el => el.addEventListener("click", e => e.stopPropagation()));
+  m.querySelectorAll(".sel").forEach(cb => cb.onchange = () => { cb.checked ? selected.add(cb.dataset.id) : selected.delete(cb.dataset.id); render(); });
+  m.querySelectorAll(".sel-all").forEach(cb => cb.onchange = () => { (cb.dataset.ids ? cb.dataset.ids.split(",") : []).forEach(id => cb.checked ? selected.add(id) : selected.delete(id)); render(); });
+  $("#bulkclear")?.addEventListener("click", () => { selected.clear(); render(); });
+  const bd = $("#bulkdel");
+  if (bd) bd.onclick = () => {
+    if (!bd.classList.contains("armed")) { bd.classList.add("armed"); bd.textContent = `Click again to permanently delete ${selected.size}`; setTimeout(() => { if (document.body.contains(bd) && bd.classList.contains("armed") && !bd.disabled) { bd.classList.remove("armed"); bd.textContent = `Delete ${selected.size} ticket${selected.size === 1 ? "" : "s"}`; } }, 4000); return; }
+    bd.disabled = true; $("#bulkclear").disabled = true;
+    bulkDelete([...selected], bd);
+  };
 
   // kanban drag & drop
   m.querySelectorAll(".card").forEach(c => c.ondragstart = e => e.dataTransfer.setData("text/plain", c.dataset.id));
