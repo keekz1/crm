@@ -80,7 +80,11 @@ const SHOTS = __dirname + '/screenshots';
   await nav('Contacts'); await page.click('text=+ Contact'); await page.fill('#modal input[name=fullName]', 'Jane Doe'); await page.click('#msave'); await page.waitForSelector('td >> text=Jane Doe');
   await nav('Sales'); await page.click('text=+ New deal');
   await page.fill('#modal input[name=title]', 'Website rebuild'); await page.selectOption('#modal select[name=contactId]', { label: 'Jane Doe' }); await page.fill('#modal input[name=value]', '12000');
+  const stageOpts = await page.$$eval('#modal select[name=stage] option', os => os.map(o => o.textContent).join(','));
+  ok(stageOpts === 'New lead,Qualified,Visit,Negotiation,Won,Lost', 'deal stages: Visit replaces Proposal (got ' + stageOpts + ')');
+  await page.fill('#modal input[name=expectedVisit]', '2026-12-03');
   await page.selectOption('#modal select[name=assigneeId]', { label: 'Sam Sales' }); await page.click('#msave'); await page.waitForSelector('#drawer.on >> text=SAL-1001');
+  ok(await page.isVisible('#drawer .kv >> text=Expected visit') && await page.isVisible('#drawer .kv >> text=3 Dec 2026'), 'deal shows its expected visit date');
   await page.click('#dclose'); await page.waitForTimeout(250);
   await nav('IT Support'); await page.click('text=+ New ticket');
   await page.fill('#modal input[name=title]', "Laptop won't boot"); await page.selectOption('#modal select[name=contactId]', { label: 'Jane Doe' }); await page.selectOption('#modal select[name=assigneeId]', { label: 'Ian IT' }); await page.click('#msave');
@@ -109,6 +113,13 @@ const SHOTS = __dirname + '/screenshots';
   await page.fill('#modal input[name=title]', 'Send menu builder demo'); await page.selectOption('#modal select[name=kind]', 'email'); await page.click('#msave');
   await page.waitForSelector('.task >> text=Send menu builder demo'); await shot('07-tasks');
   await nav('Contacts'); ok(await page.isVisible('td >> text=Maya Ross'), 'converted lead is now a shared contact');
+
+  // ---- a deal saved in the old "Proposal" stage moves to "Visit"
+  const legacyId = await api(async c => { const d = (await c.models.Department.list()).data.find(x => x.name === 'Sales'); return (await c.models.Ticket.create({ departmentId: d.id, departmentGroup: d.groupName, title: 'Old proposal deal', stage: 'proposal', value: 500, refCode: 'SAL-9001' })).data.id; });
+  await page.reload(); await page.waitForSelector('.shell'); await nav('Sales'); await page.waitForTimeout(300);
+  const saved = await api(async (c, id) => (await c.models.Ticket.get({ id })).data.stage, legacyId);
+  ok(await page.isVisible('.col[data-stage=visit] >> text=Old proposal deal') && saved === 'visit', 'old Proposal deals show under Visit and are saved as Visit (saved: ' + saved + ')');
+  await api(async (c, id) => c.models.Ticket.delete({ id }), legacyId);
 
   // ---- IT support CRM: assets, ticket for a device, knowledge base
   await nav('IT Support');
@@ -169,6 +180,11 @@ const SHOTS = __dirname + '/screenshots';
   ok(samLeadDel === 'Unauthorized', 'Sam: API refuses deleting a lead (only managers delete)');
   await nav('Sales'); await page.click('.tabs >> text=Leads'); await page.selectOption('#f-lstatus', ''); await page.click('tr:has-text("Maya Ross")'); await page.waitForSelector('#drawer.on');
   ok(!(await page.isVisible('#ddel')), 'Sam: no Delete button on a lead'); await page.click('#dclose'); await page.waitForTimeout(250);
+  await nav('Contacts'); await page.click('td >> text=Jane Doe'); await page.waitForSelector('#drawer.on >> text=SAL-1001');
+  ok(!(await page.isVisible("#drawer >> text=IT-1001")) && !(await page.isVisible("#drawer >> text=Laptop won't boot")), "Sam: a shared contact shows only Sales tickets, never the IT department's");
+  await page.click('#dclose'); await page.waitForTimeout(250); await nav('Dashboard');
+  const samScreen = await page.innerText('main');
+  ok(!/IT-10|Laptop won't boot|Till screen frozen|IT Support/.test(samScreen), 'Sam: nothing from the IT department anywhere on the dashboard');
   await nav('Sales'); ok((await page.$$('.sel, .sel-all')).length === 0, 'Sam: no bulk-delete checkboxes for members');
   const samDel = await api(async c => { const t = (await c.models.Ticket.list()).data[0]; return (await c.models.Ticket.delete({ id: t.id })).errors?.[0]?.errorType; });
   ok(samDel === 'Unauthorized', 'Sam: API refuses ticket deletion by members');

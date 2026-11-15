@@ -52,9 +52,10 @@ const schema = a.schema({
       slaDue: a.datetime(),
       resolvedAt: a.datetime(),
       // pipeline departments
-      stage: a.string(), // new | qualified | proposal | negotiation | won | lost
+      stage: a.string(), // new | qualified | visit | negotiation | won | lost  (old "proposal" deals are moved to "visit" by the app)
       value: a.float(),
       expectedClose: a.date(),
+      expectedVisit: a.date(),
       source: a.string(),
       lostReason: a.string(),
       closedAt: a.datetime(),

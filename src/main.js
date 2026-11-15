@@ -31,7 +31,8 @@ const TASK_KINDS = [["call", "Call"], ["meeting", "Meeting"], ["email", "Email"]
 const ASSET_TYPES = ["Till / POS", "Tablet", "Kitchen screen", "Receipt printer", "Kitchen printer", "Card reader", "Router / Wi-Fi", "PC / laptop", "Mini PC / server", "Phone", "Other"];
 const ASSET_STATUSES = [["in_use", "In use"], ["spare", "Spare"], ["repair", "Being repaired"], ["retired", "Retired"]];
 const KB_CATEGORIES = ["How-to", "Known fix", "Setup guide", "Troubleshooting", "Policy", "FAQ", "Other"];
-const STAGES = [["new", "New lead"], ["qualified", "Qualified"], ["proposal", "Proposal"], ["negotiation", "Negotiation"], ["won", "Won"], ["lost", "Lost"]];
+const STAGES = [["new", "New lead"], ["qualified", "Qualified"], ["visit", "Visit"], ["negotiation", "Negotiation"], ["won", "Won"], ["lost", "Lost"]];
+const OLD_STAGES = { proposal: "visit" }; // stages that were renamed: deals still in them move to the new one
 const STATUSES = [["open", "Open"], ["in_progress", "In progress"], ["waiting", "Waiting on customer"], ["resolved", "Resolved"], ["closed", "Closed"]];
 const PRIOS = [["urgent", "Urgent"], ["high", "High"], ["normal", "Normal"], ["low", "Low"]];
 const SLA_HOURS = { urgent: 4, high: 8, normal: 24, low: 72 };
@@ -132,13 +133,25 @@ async function listAll(model, filter) {
 }
 // (a table the backend doesn't have yet, e.g. mid-deploy, just loads as empty)
 const fetchAll = async table => client.models[MODEL[table]] ? (await listAll(MODEL[table])).sort((a, b) => ts(a.createdAt) - ts(b.createdAt)) : [];
+// Deals still in a renamed stage (e.g. Proposal → Visit) are shown in the new stage and saved there once.
+const migrating = new Set();
+function migrateStages() {
+  for (const t of S.tickets) {
+    const to = OLD_STAGES[t.stage]; if (!to) continue;
+    t.stage = to;
+    if (migrating.has(t.id)) continue;
+    migrating.add(t.id);
+    client.models.Ticket.update({ id: t.id, stage: to }).catch(e => console.warn("stage update", e));
+  }
+}
 async function loadAll() {
   const results = await Promise.all(TABLES.map(fetchAll));
   TABLES.forEach((t, i) => S[t] = results[i]);
+  migrateStages();
   if (isManager()) await loadStaff();
 }
 async function refreshQuietly() {
-  try { const results = await Promise.all(TABLES.map(fetchAll)); TABLES.forEach((t, i) => S[t] = results[i]); } catch (e) { console.warn("refresh", e); return; }
+  try { const results = await Promise.all(TABLES.map(fetchAll)); TABLES.forEach((t, i) => S[t] = results[i]); migrateStages(); } catch (e) { console.warn("refresh", e); return; }
   for (const id of [...selected]) if (!byId(S.tickets, id)) selected.delete(id);
   render(); if (openRec) refreshDrawer(true);
 }
@@ -555,7 +568,8 @@ function vBoard(d) {
       return `<div class="col" data-stage="${k}"><div class="col-h">${isManager() && c.length ? `<input type="checkbox" class="sel-all" data-ids="${c.map(t => t.id).join(",")}" ${c.every(t => selected.has(t.id)) ? "checked" : ""} title="Select all in ${l}" aria-label="Select all in ${l}">` : ""}<span class="col-t">${l}</span><small>${c.length} · ${money(c.reduce((s, t) => s + (+t.value || 0), 0))}</small></div>
       ${c.map(t => `<div class="card ${selected.has(t.id) ? "picked" : ""}" draggable="true" data-id="${t.id}" data-open="tickets:${t.id}"><div class="id">${isManager() ? `<input type="checkbox" class="sel" data-id="${t.id}" ${selected.has(t.id) ? "checked" : ""} aria-label="Select ${esc(refLabel(t))}">` : ""}${esc(refLabel(t))}</div><div class="t">${esc(t.title)}</div>
         <div class="m"><span>${esc(company(t.companyId)?.name || contact(t.contactId)?.fullName || "")}</span><span class="val">${money(t.value)}</span></div>
-        <div class="m" style="margin-top:4px"><span>${t.expectedClose ? "Close " + fmtDate(t.expectedClose) : ""}</span><span>${esc(pname(t.assigneeId))}</span></div></div>`).join("")}</div>`;
+        <div class="m" style="margin-top:4px"><span>${t.expectedClose ? "Close " + fmtDate(t.expectedClose) : ""}</span><span>${esc(pname(t.assigneeId))}</span></div>
+        ${t.expectedVisit ? `<div class="m" style="margin-top:4px"><span>Visit ${fmtDate(t.expectedVisit)}</span></div>` : ""}</div>`).join("")}</div>`;
     }).join("")}</div>${bulkBar()}`;
   }
   const list = sortByUrgency(ticketsIn(d).filter(t => match(t)
@@ -863,8 +877,8 @@ function csv(name, header, rows) {
 function exportBoard() {
   const d = dept(viewDept); if (!d) return;
   const slug = d.name.toLowerCase().replace(/[^a-z0-9]+/g, "-");
-  if (d.kind === "pipeline") csv(slug, ["Ref", "Title", "Company", "Contact", "Value", "Stage", "Owner", "Expected close", "Source", "Created"],
-    ticketsIn(d).map(t => [refLabel(t), t.title, company(t.companyId)?.name, contact(t.contactId)?.fullName, t.value, label(STAGES, t.stage), pname(t.assigneeId), t.expectedClose, t.source, fmtDate(t.createdAt)]));
+  if (d.kind === "pipeline") csv(slug, ["Ref", "Title", "Company", "Contact", "Value", "Stage", "Owner", "Expected close", "Expected visit", "Source", "Created"],
+    ticketsIn(d).map(t => [refLabel(t), t.title, company(t.companyId)?.name, contact(t.contactId)?.fullName, t.value, label(STAGES, t.stage), pname(t.assigneeId), t.expectedClose, t.expectedVisit, t.source, fmtDate(t.createdAt)]));
   else csv(slug, ["Ref", "Title", "Requester", "Company", "Category", "Priority", "Status", "Assignee", "Opened", "SLA due", "Resolved"],
     ticketsIn(d).map(t => [refLabel(t), t.title, contact(t.contactId)?.fullName, company(t.companyId)?.name, t.category, label(PRIOS, t.priority), label(STATUSES, t.status), pname(t.assigneeId), fmtDT(t.createdAt), fmtDT(t.slaDue), t.resolvedAt ? fmtDT(t.resolvedAt) : ""]));
 }
@@ -944,7 +958,7 @@ function formTicket(t, d, preset = {}) {
     ...newContactFields,
     { k: "value", label: "Value (£)", type: "number", half: true }, { k: "stage", label: "Stage", type: "select", opts: STAGES, half: true },
     { k: "assigneeId", label: "Owner", type: "select", opts: people, half: true }, { k: "expectedClose", label: "Expected close", type: "date", half: true },
-    { k: "source", label: "Lead source", list: SOURCES },
+    { k: "source", label: "Lead source", list: SOURCES, half: true }, { k: "expectedVisit", label: "Expected visit", type: "date", half: true },
     { k: "lostReason", label: "Reason lost", showIf: "stage=lost" },
     { k: "description", label: "Details", type: "textarea" },
   ] : [
@@ -961,7 +975,7 @@ function formTicket(t, d, preset = {}) {
     if (!(await resolveContact(o))) return false;
     const common = { title: o.title, contactId: nul(o.contactId), companyId: nul(o.companyId), assigneeId: nul(o.assigneeId), description: nul(o.description) };
     const row = pipe
-      ? { ...common, value: Number(o.value) || 0, stage: o.stage, expectedClose: nul(o.expectedClose), source: nul(o.source), lostReason: o.stage === "lost" ? nul(o.lostReason) : null }
+      ? { ...common, value: Number(o.value) || 0, stage: o.stage, expectedClose: nul(o.expectedClose), expectedVisit: nul(o.expectedVisit), source: nul(o.source), lostReason: o.stage === "lost" ? nul(o.lostReason) : null }
       : { ...common, category: nul(o.category), priority: o.priority, status: o.status, assetId: nul(o.assetId) };
     if (isNew) row.departmentId = d.id;
     const r = await saveTicket(isNew ? null : t, row);
@@ -1086,6 +1100,7 @@ function convertLead(l) {
     { k: "_i", type: "info", label: "This will", html: `<span class="hint">Create a contact for ${esc(l.fullName)}${l.companyName ? ` at ${esc(l.companyName)}` : ""} and a deal in ${esc(d.name)}. Their open tasks move to the deal.</span>` },
     { k: "title", label: "Deal name", req: true },
     { k: "value", label: "Value (£)", type: "number", half: true }, { k: "expectedClose", label: "Expected close", type: "date", half: true },
+    { k: "_v", type: "info", label: "", html: "", half: true }, { k: "expectedVisit", label: "Expected visit", type: "date", half: true },
     { k: "stage", label: "Stage", type: "select", opts: STAGES.filter(x => !["won", "lost"].includes(x[0])), half: true }, { k: "assigneeId", label: "Owner", type: "select", opts: people, half: true },
   ], { title: l.companyName || l.fullName, stage: "qualified", assigneeId: l.ownerId || S.me.id }, async o => {
     let companyId = null;
@@ -1097,7 +1112,7 @@ function convertLead(l) {
     const sameContact = l.email && S.contacts.find(c => (c.email || "").toLowerCase() === l.email.toLowerCase());
     const c = sameContact || await ins("contacts", { fullName: l.fullName, email: nul(l.email), phone: nul(l.phone), companyId, notes: nul(l.notes), createdBy: S.me.id });
     if (!c) return false;
-    const deal = await saveTicket(null, { departmentId: d.id, title: o.title, value: Number(o.value) || 0, stage: o.stage, expectedClose: nul(o.expectedClose), assigneeId: nul(o.assigneeId), contactId: c.id, companyId: companyId || c.companyId || null, source: nul(l.source), description: nul(l.notes), leadId: l.id });
+    const deal = await saveTicket(null, { departmentId: d.id, title: o.title, value: Number(o.value) || 0, stage: o.stage, expectedClose: nul(o.expectedClose), expectedVisit: nul(o.expectedVisit), assigneeId: nul(o.assigneeId), contactId: c.id, companyId: companyId || c.companyId || null, source: nul(l.source), description: nul(l.notes), leadId: l.id });
     if (!deal) return false;
     await upd("leads", l.id, { status: "converted", convertedAt: nowISO(), convertedTicketId: deal.id, convertedContactId: c.id });
     for (const k of S.tasks.filter(x => x.leadId === l.id && !x.done)) await upd("tasks", k.id, { ticketId: deal.id });
@@ -1198,6 +1213,7 @@ function drawDrawer() {
         <span class="k">Contact</span><span>${linkC(r.contactId)}</span>
         <span class="k">Company</span><span>${linkO(r.companyId)}</span>
         <span class="k">Expected close</span><span>${fmtDate(r.expectedClose)}</span>
+        <span class="k">Expected visit</span><span>${fmtDate(r.expectedVisit)}</span>
         <span class="k">Source</span><span>${esc(r.source || "—")}</span>
         ${r.stage === "lost" && r.lostReason ? `<span class="k">Reason lost</span><span>${esc(r.lostReason)}</span>` : ""}
         ${r.leadId && lead(r.leadId) ? `<span class="k">From lead</span><span><a href="#" data-jump="leads:${r.leadId}">${esc(lead(r.leadId).fullName)}</a></span>` : ""}`
