@@ -208,10 +208,23 @@ async function removeDepartmentGroup(groupName: string) {
   return { groupName, removed: true };
 }
 
-// AppSync passes { arguments, identity, info } for custom queries/mutations.
+// Last resort if the operation name isn't provided: work it out from which arguments were sent.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function inferOperation(args: any): string {
+  if (args.email !== undefined) return "inviteUser";
+  if (args.enabled !== undefined) return "setUserEnabled";
+  if (args.manager !== undefined) return "setUserAccess";
+  if (args.groupName !== undefined) return ""; // ambiguous (ensure/remove): refuse rather than guess
+  if (args.username !== undefined) return ""; // ambiguous (resend/remove): refuse rather than guess
+  return Object.keys(args).length === 0 ? "listStaff" : "";
+}
+
+// Called by AppSync for the custom queries/mutations in data/resource.ts.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export const handler = async (event: any) => {
-  const field: string = event?.info?.fieldName ?? "";
+  // Amplify passes { typeName, fieldName, arguments, identity, ... } (fieldName at the top level);
+  // plain AppSync direct Lambda resolvers use info.fieldName. Support both, and fall back to the arguments.
+  const field: string = event?.fieldName || event?.info?.fieldName || inferOperation(event?.arguments ?? {});
   const args = event?.arguments ?? {};
   const caller: string = event?.identity?.username ?? "";
   if (!caller) throw new Error("Not signed in");
@@ -240,6 +253,6 @@ export const handler = async (event: any) => {
     case "removeDepartmentGroup":
       return removeDepartmentGroup(String(args.groupName));
     default:
-      throw new Error(`Unknown operation "${field}"`);
+      throw new Error(`Unknown operation "${field}" (event keys: ${Object.keys(event ?? {}).join(", ")})`);
   }
 };
