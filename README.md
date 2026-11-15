@@ -8,12 +8,14 @@ A general multi-user CRM organised by **departments**:
 - **Team members** only see tickets from the departments they belong to. Someone in Sales can't see IT tickets, and vice versa. People can belong to more than one department.
 - **Customers** (contacts and companies) are one shared directory, so the same customer isn't entered twice. Each person still only sees *tickets* from their own departments.
 
-Each department is one of two types:
+Each department is its own CRM, chosen by its type (like Zoho CRM vs Zoho Desk):
 
-| Type | Board | Fields |
-|---|---|---|
-| **Support queue** | Ticket list with filters | Priority, status, SLA timer (Urgent 4h · High 8h · Normal 24h · Low 72h), category, assignee |
-| **Sales pipeline** | Drag-and-drop stages | Deal value, stage (New lead → … → Won / Lost), owner, expected close, lead source |
+| Type | Sections |
+|---|---|
+| **Sales CRM** | **Deals**: drag-and-drop pipeline (New lead → … → Won / Lost) with value, owner, expected close, lead source. **Leads**: new enquiries with status and owner; *Convert to deal* creates the contact (and company) plus a deal, and moves the lead's open tasks to it. **Activities & tasks**: calls, meetings, emails and to-dos with due dates, linked to a deal, lead or contact; ticking one done logs it on the deal. |
+| **IT support CRM** | **Tickets**: priority, status, SLA timer (Urgent 4h · High 8h · Normal 24h · Low 72h), category, assignee and the device it's about. **Assets**: tills, tablets, printers, routers… per customer and site, with serial number, status and warranty (expired warranties flagged); raise a ticket straight from a device. **Knowledge base**: fixes and how-tos; tickets suggest matching articles. |
+
+Everything is saved in DynamoDB and kept: **only managers can delete** tickets, leads, tasks, assets or articles (AppSync refuses deletes from anyone else). Members of one department can't see another department's records at all.
 
 **Old tickets** are never deleted automatically. Resolved/closed tickets drop out of the default *Active* view but stay searchable. Managers can **bulk delete**: on any department board, use the *Closed* filter (e.g. "Closed 1+ year ago"), tick tickets or "select all", then click *Delete* twice to confirm. Each ticket's activity history is deleted with it. Members can't delete tickets, and AppSync refuses it.
 
@@ -24,7 +26,7 @@ Tickets are numbered per department with a prefix you choose (`IT-1001`, `SAL-10
 It runs entirely on AWS through **Amplify Gen 2**: Cognito (logins), AppSync (API), DynamoDB (data), Lambda (team admin) and Amplify Hosting.
 
 - Each department is a **Cognito group** (`dept-xxxx`), created automatically when a manager adds the department.
-- Every ticket stores its department's group, and **AppSync only returns it to members of that group, or to MANAGERS**. This is checked on every API request, not just hidden in the UI.
+- Every ticket, lead, task, asset and article stores its department's group, and **AppSync only returns it to members of that group, or to MANAGERS**. This is checked on every API request, not just hidden in the UI.
 - `MANAGERS` see everything. `STAFF` (any approved person) can use the shared customer directory. People in no group are *pending* and see nothing.
 - Self sign-up is switched off in Cognito (`AllowAdminCreateUserOnly`), so accounts can only be created by managers through the app (an admin Lambda calls `AdminCreateUser`).
 - The owner account can't be removed, disabled or demoted from the app, and there must always be at least one manager.

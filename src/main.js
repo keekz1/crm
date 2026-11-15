@@ -11,12 +11,26 @@ import "./app.css";
    CoreCRM: a general CRM organised by departments (AWS Amplify Gen 2).
    - Managers create departments, add people to them, and see everything.
    - Everyone else only sees tickets of the departments they belong to.
+   - Each department is its own CRM, chosen by its type:
+       Sales CRM (kind "pipeline"):   Deals · Leads · Activities & tasks
+       Support CRM (kind "support"):  Tickets · Assets · Knowledge base
+   - Everything is saved in DynamoDB; only managers can delete anything.
    Access is enforced by AppSync using Cognito groups (amplify/data/resource.ts);
    the UI only hides what a person can't use.
    ===================================================================== */
 
 const APP_NAME = "CoreCRM";
-const KINDS = [["support", "Support queue"], ["pipeline", "Sales pipeline"]];
+const KINDS = [["support", "IT support CRM"], ["pipeline", "Sales CRM"]];
+// The sections of each department's CRM (#d-<id>/<tab>). The first one is the default.
+const TABS = {
+  pipeline: [["deals", "Deals"], ["leads", "Leads"], ["tasks", "Activities & tasks"]],
+  support: [["tickets", "Tickets"], ["assets", "Assets"], ["kb", "Knowledge base"]],
+};
+const LEAD_STATUSES = [["new", "New"], ["contacted", "Contacted"], ["qualified", "Qualified"], ["unqualified", "Not interested"], ["converted", "Converted to deal"]];
+const TASK_KINDS = [["call", "Call"], ["meeting", "Meeting"], ["email", "Email"], ["task", "To-do"]];
+const ASSET_TYPES = ["Till / POS", "Tablet", "Kitchen screen", "Receipt printer", "Kitchen printer", "Card reader", "Router / Wi-Fi", "PC / laptop", "Mini PC / server", "Phone", "Other"];
+const ASSET_STATUSES = [["in_use", "In use"], ["spare", "Spare"], ["repair", "Being repaired"], ["retired", "Retired"]];
+const KB_CATEGORIES = ["How-to", "Known fix", "Setup guide", "Troubleshooting", "Policy", "FAQ", "Other"];
 const STAGES = [["new", "New lead"], ["qualified", "Qualified"], ["proposal", "Proposal"], ["negotiation", "Negotiation"], ["won", "Won"], ["lost", "Lost"]];
 const STATUSES = [["open", "Open"], ["in_progress", "In progress"], ["waiting", "Waiting on customer"], ["resolved", "Resolved"], ["closed", "Closed"]];
 const PRIOS = [["urgent", "Urgent"], ["high", "High"], ["normal", "Normal"], ["low", "Low"]];
@@ -29,10 +43,10 @@ const label = (list, v) => (list.find(x => x[0] === v) || [, v])[1];
 
 /* ---------- state ---------- */
 let client = null;
-const S = { user: null, me: null, profiles: [], companies: [], contacts: [], departments: [], tickets: [], staff: null };
-let view = "dashboard", viewDept = null, openRec = null, activity = [], authEmail = "";
+const S = { user: null, me: null, profiles: [], companies: [], contacts: [], departments: [], tickets: [], leads: [], tasks: [], assets: [], articles: [], staff: null };
+let view = "dashboard", viewDept = null, viewTab = null, openRec = null, activity = [], authEmail = "";
 const F = { board: {}, contacts: { q: "", company: "" }, companies: { q: "" } };
-const boardF = id => F.board[id] || (F.board[id] = { q: "", status: "active", priority: "", assignee: "", owner: "", mine: false, age: "" });
+const boardF = id => F.board[id] || (F.board[id] = { q: "", status: "active", priority: "", assignee: "", owner: "", mine: false, age: "", leadStatus: "active", taskShow: "open", taskOwner: "", assetType: "", assetStatus: "active", assetCompany: "", kbCat: "" });
 const selected = new Set(); // ticket ids ticked for bulk delete (managers only)
 const AGES = [["", "Any age"], ["0", "Closed: any time"], ["30", "Closed 30+ days ago"], ["90", "Closed 90+ days ago"], ["180", "Closed 6+ months ago"], ["365", "Closed 1+ year ago"]];
 
@@ -69,6 +83,16 @@ const closedFor = (t, days) => !isOpen(t) && closedOn(t) && Date.now() - ts(clos
 const refLabel = t => t.refCode || `${deptOf(t)?.code || "T"}-${t.ref ?? "?"}`;
 const prioRank = p => { const i = PRIOS.findIndex(x => x[0] === p); return i < 0 ? 9 : i; };
 const ticketsIn = d => S.tickets.filter(t => t.departmentId === d.id);
+const inDept = (table, d) => S[table].filter(x => x.departmentId === d.id);
+const lead = id => byId(S.leads, id);
+const asset = id => byId(S.assets, id);
+const tabsOf = d => TABS[d?.kind] || TABS.support;
+// Anything a department holds (it can only be deleted, or change type, when empty)
+const deptRecords = d => ticketsIn(d).length + inDept("leads", d).length + inDept("tasks", d).length + inDept("assets", d).length + inDept("articles", d).length;
+const endOfToday = () => { const x = new Date(); x.setHours(23, 59, 59, 999); return x.getTime(); };
+const taskOverdue = k => !k.done && k.dueAt && ts(k.dueAt) < Date.now();
+const taskDueToday = k => !k.done && k.dueAt && ts(k.dueAt) <= endOfToday();
+const warrantyOver = a => a.warrantyUntil && ts(a.warrantyUntil + "T23:59:59") < Date.now();
 const deptTag = d => d ? `<span class="dtag" style="--c:${esc(d.color || COLORS[0])}">${esc(d.name)}</span>` : `<span class="dtag">Unknown</span>`;
 
 // People who can be assigned work in a department: its members plus managers (exact for managers,
@@ -90,7 +114,7 @@ function friendly(e) {
 }
 
 /* ---------- data ---------- */
-const MODEL = { profiles: "Profile", companies: "Company", contacts: "Contact", departments: "Department", tickets: "Ticket" };
+const MODEL = { profiles: "Profile", companies: "Company", contacts: "Contact", departments: "Department", tickets: "Ticket", leads: "Lead", tasks: "SalesTask", assets: "Asset", articles: "Article" };
 const TABLES = Object.keys(MODEL);
 const firstErr = res => (res?.errors && res.errors.length ? res.errors[0] : null);
 const plain = r => { const o = {}; for (const [k, v] of Object.entries(r || {})) if (typeof v !== "function") o[k] = v; return o; };
@@ -106,7 +130,8 @@ async function listAll(model, filter) {
   } while (nextToken);
   return out;
 }
-const fetchAll = async table => (await listAll(MODEL[table])).sort((a, b) => ts(a.createdAt) - ts(b.createdAt));
+// (a table the backend doesn't have yet, e.g. mid-deploy, just loads as empty)
+const fetchAll = async table => client.models[MODEL[table]] ? (await listAll(MODEL[table])).sort((a, b) => ts(a.createdAt) - ts(b.createdAt)) : [];
 async function loadAll() {
   const results = await Promise.all(TABLES.map(fetchAll));
   TABLES.forEach((t, i) => S[t] = results[i]);
@@ -382,8 +407,9 @@ function showPending() {
 /* ---------- routing & shell ---------- */
 function route() {
   const h = location.hash.slice(1) || "dashboard";
-  viewDept = null; selected.clear();
-  if (h.startsWith("d-") && dept(h.slice(2))) { view = "board"; viewDept = h.slice(2); }
+  viewDept = null; viewTab = null; selected.clear();
+  const [dId, tab] = h.startsWith("d-") ? h.slice(2).split("/") : [];
+  if (dId && dept(dId)) { view = "board"; viewDept = dId; const tabs = tabsOf(dept(dId)); viewTab = tabs.some(t => t[0] === tab) ? tab : tabs[0][0]; }
   else if (["dashboard", "mine", "contacts", "companies"].includes(h) || (isManager() && ["departments", "team"].includes(h))) view = h;
   else view = "dashboard";
   closeDrawer(); render();
@@ -417,7 +443,7 @@ function render() {
   bindShell();
   if (view === "board" && !dept(viewDept)) view = "dashboard";
   const act = document.activeElement, keep = act?.id, pos = act?.selectionStart;
-  $("#main").innerHTML = ({ dashboard: vDashboard, mine: vMine, board: () => vBoard(dept(viewDept)), contacts: vContacts, companies: vCompanies, departments: vDepartments, team: vTeam })[view]();
+  $("#main").innerHTML = ({ dashboard: vDashboard, mine: vMine, board: () => vDept(dept(viewDept)), contacts: vContacts, companies: vCompanies, departments: vDepartments, team: vTeam })[view]();
   bindMain();
   if (keep && document.getElementById(keep)) { const el = document.getElementById(keep); el.focus(); try { el.setSelectionRange(pos, pos); } catch { } }
 }
@@ -452,6 +478,7 @@ function vDashboard() {
   const open = S.tickets.filter(isOpen), mine = open.filter(t => t.assigneeId === S.me.id), od = open.filter(isOverdue), un = open.filter(t => !t.assigneeId);
   const pipeOpen = open.filter(t => kindOf(t) === "pipeline");
   const hasPipe = S.departments.some(d => d.kind === "pipeline");
+  const myTasksDue = S.tasks.filter(k => k.ownerId === S.me.id && taskDueToday(k)).sort((a, b) => ts(a.dueAt) - ts(b.dueAt));
   let h = `<div class="head"><div><h1>${first ? "Hi " + esc(first) : "Dashboard"}</h1><div class="sub">${isManager() ? "Everything across all departments" : "Your departments"} · ${new Date().toLocaleDateString("en-GB", { weekday: "long", day: "numeric", month: "long" })}</div></div><span class="spacer"></span>
     ${S.departments.length ? `<button class="btn primary" data-act="newTicket">+ New ticket</button>` : ""}</div>`;
   if (!S.departments.length) {
@@ -462,16 +489,19 @@ function vDashboard() {
     <div class="stat"><div class="k">Assigned to me</div><div class="v">${mine.length}</div></div>
     <div class="stat"><div class="k">Past SLA</div><div class="v" style="${od.length ? "color:var(--bad)" : ""}">${od.length}</div></div>
     <div class="stat"><div class="k">Unassigned</div><div class="v">${un.length}</div></div>
-    ${hasPipe ? `<div class="stat"><div class="k">Open pipeline</div><div class="v">${money(pipeOpen.reduce((s, t) => s + (+t.value || 0), 0))}</div></div>` : ""}</div>
+    ${hasPipe ? `<div class="stat"><div class="k">Open pipeline</div><div class="v">${money(pipeOpen.reduce((s, t) => s + (+t.value || 0), 0))}</div></div>
+    <div class="stat"><div class="k">Open leads</div><div class="v">${S.leads.filter(l => !["converted", "unqualified"].includes(l.status)).length}</div></div>
+    <div class="stat"><div class="k">My tasks due</div><div class="v" style="${myTasksDue.some(taskOverdue) ? "color:var(--bad)" : ""}">${myTasksDue.length}</div></div>` : ""}</div>
   <div class="section-title">Departments</div><div class="dcards">${depts().map(d => {
     const all = ticketsIn(d), o = all.filter(isOpen);
     const sub = d.kind === "pipeline"
-      ? `${money(o.reduce((s, t) => s + (+t.value || 0), 0))} open · ${all.filter(t => t.stage === "won").length} won`
-      : `${o.filter(isOverdue).length} past SLA · ${o.filter(t => !t.assigneeId).length} unassigned`;
+      ? `${money(o.reduce((s, t) => s + (+t.value || 0), 0))} open · ${all.filter(t => t.stage === "won").length} won · ${inDept("leads", d).filter(l => !["converted", "unqualified"].includes(l.status)).length} leads`
+      : `${o.filter(isOverdue).length} past SLA · ${o.filter(t => !t.assigneeId).length} unassigned · ${inDept("assets", d).filter(a => a.status !== "retired").length} assets`;
     return `<a class="dcard" href="#d-${d.id}" style="--c:${esc(d.color || COLORS[0])}"><div class="dn">${esc(d.name)}</div><div class="hint">${label(KINDS, d.kind)} · ${esc(d.code)}</div><div class="dv">${o.length} <small>open</small></div><div class="hint">${sub}</div></a>`;
   }).join("")}</div>
   <div class="two"><div class="panel"><h3>Needs attention</h3>${ticketTable(sortByUrgency(open.filter(t => isOverdue(t) || t.priority === "urgent" || !t.assigneeId)).slice(0, 8), { dept: true }, "Nothing urgent 🎉")}</div>
-  <div class="panel"><h3>Assigned to me</h3>${ticketTable(sortByUrgency(mine).slice(0, 8), { dept: true }, "Nothing assigned to you")}</div></div>`;
+  <div class="panel"><h3>Assigned to me</h3>${ticketTable(sortByUrgency(mine).slice(0, 8), { dept: true }, "Nothing assigned to you")}</div></div>
+  ${hasPipe ? `<div class="panel tasks"><h3>My tasks due today</h3>${myTasksDue.length ? taskRows(myTasksDue.slice(0, 10)) : `<div class="empty">Nothing due. Nice.</div>`}</div>` : ""}`;
   return h;
 }
 
@@ -481,14 +511,41 @@ function vMine() {
   <div class="panel">${ticketTable(list, { dept: true }, "Nothing assigned to you")}</div>`;
 }
 
+/* ---------- a department's own CRM: its sections as tabs ---------- */
+function deptHead(d, extraButtons) {
+  const f = boardF(d.id), tabs = tabsOf(d);
+  const sub = viewTab === "deals" ? "Drag cards between stages"
+    : viewTab === "tickets" ? "SLA: Urgent 4h · High 8h · Normal 24h · Low 72h"
+    : viewTab === "leads" ? "New enquiries. Convert one into a contact and a deal when it's real."
+    : viewTab === "tasks" ? "Calls, meetings, emails and to-dos, with due dates"
+    : viewTab === "assets" ? "Equipment you look after, per customer and site"
+    : "Fixes and how-tos your team reuses";
+  return `<div class="head"><div><h1>${deptTag(d)} ${esc(d.name)}</h1><div class="sub">${label(KINDS, d.kind)} · ${sub}${d.description ? " · " + esc(d.description) : ""}</div></div><span class="spacer"></span>
+    <input class="search" id="f-q" placeholder="Search…" value="${esc(f.q)}">${extraButtons}</div>
+  <div class="tabs" style="--c:${esc(d.color || COLORS[0])}">${tabs.map(([k, l]) => {
+    const n = k === "leads" ? inDept("leads", d).filter(x => !["converted", "unqualified"].includes(x.status)).length
+      : k === "tasks" ? inDept("tasks", d).filter(x => !x.done).length
+      : k === "assets" ? inDept("assets", d).filter(x => x.status !== "retired").length
+      : k === "kb" ? inDept("articles", d).length
+      : ticketsIn(d).filter(isOpen).length;
+    const alert = (k === "tasks" && inDept("tasks", d).some(taskOverdue)) || (k === "tickets" && ticketsIn(d).some(isOverdue));
+    return `<a href="#d-${d.id}/${k}" class="${viewTab === k ? "on" : ""}">${esc(l)}<span class="count ${alert ? "alert" : ""}">${n}</span></a>`;
+  }).join("")}</div>`;
+}
+function vDept(d) {
+  if (viewTab === "leads") return vLeads(d);
+  if (viewTab === "tasks") return vTasks(d);
+  if (viewTab === "assets") return vAssets(d);
+  if (viewTab === "kb") return vKB(d);
+  return vBoard(d);
+}
+
 function vBoard(d) {
   const f = boardF(d.id), q = f.q.toLowerCase(), people = peopleFor(d);
-  const match = t => !q || [t.title, refLabel(t), contact(t.contactId)?.fullName, company(t.companyId)?.name, t.category].join(" ").toLowerCase().includes(q);
+  const match = t => !q || [t.title, refLabel(t), contact(t.contactId)?.fullName, company(t.companyId)?.name, t.category, asset(t.assetId)?.name, asset(t.assetId)?.serial].join(" ").toLowerCase().includes(q);
   const sel = (id, cur, opts) => `<select id="${id}">${opts.map(([v, l]) => `<option value="${esc(v)}" ${v === cur ? "selected" : ""}>${esc(l)}</option>`).join("")}</select>`;
-  const head = `<div class="head"><div><h1>${deptTag(d)} ${esc(d.name)}</h1><div class="sub">${label(KINDS, d.kind)}${d.kind === "support" ? " · SLA: Urgent 4h · High 8h · Normal 24h · Low 72h" : " · drag cards between stages"}${d.description ? " · " + esc(d.description) : ""}</div></div><span class="spacer"></span>
-    <input class="search" id="f-q" placeholder="Search…" value="${esc(f.q)}">
-    <button class="btn" data-act="exportBoard">Export CSV</button>
-    <button class="btn primary" data-act="newInDept">+ ${d.kind === "pipeline" ? "New deal" : "New ticket"}</button></div>`;
+  const head = deptHead(d, `<button class="btn" data-act="exportBoard">Export CSV</button>
+    <button class="btn primary" data-act="newInDept">+ ${d.kind === "pipeline" ? "New deal" : "New ticket"}</button>`);
   if (d.kind === "pipeline") {
     const list = ticketsIn(d).filter(t => match(t) && (!f.owner || t.assigneeId === f.owner) && (!f.mine || t.assigneeId === S.me.id) && (f.age === "" || closedFor(t, f.age)));
     return head + `<div class="filters">${sel("f-owner", f.owner, [["", "All owners"], ...people.map(p => [p.id, p.fullName || p.email])])}<label class="chk"><input type="checkbox" id="f-mine" ${f.mine ? "checked" : ""}> Mine</label>
@@ -541,6 +598,96 @@ async function bulkDelete(ids, btn) {
   listAll("TicketActivity").then(rows => rows.filter(a => gone.has(a.ticketId)).forEach(a => client.models.TicketActivity.delete({ id: a.id }))).catch(e => console.warn(e));
 }
 
+/* ---------- Sales CRM: Leads ---------- */
+const selBox = (id, cur, opts) => `<select id="${id}">${opts.map(([v, l]) => `<option value="${esc(v)}" ${v === cur ? "selected" : ""}>${esc(l)}</option>`).join("")}</select>`;
+const leadPill = l => `<span class="pill ld-${esc(l.status || "new")}">${label(LEAD_STATUSES, l.status || "new")}</span>`;
+function vLeads(d) {
+  const f = boardF(d.id), q = f.q.toLowerCase(), people = peopleFor(d);
+  const list = inDept("leads", d).filter(l => (!q || [l.fullName, l.companyName, l.email, l.phone, l.source].join(" ").toLowerCase().includes(q))
+    && (f.leadStatus === "active" ? !["converted", "unqualified"].includes(l.status) : !f.leadStatus || (l.status || "new") === f.leadStatus)
+    && (!f.owner || l.ownerId === f.owner) && (!f.mine || l.ownerId === S.me.id))
+    .sort((a, b) => ts(b.createdAt) - ts(a.createdAt));
+  return deptHead(d, `<button class="btn primary" data-act="newLead">+ New lead</button>`) + `<div class="filters">
+    ${selBox("f-lstatus", f.leadStatus, [["active", "Open leads"], ["", "All leads"], ...LEAD_STATUSES])}
+    ${selBox("f-owner", f.owner, [["", "All owners"], ...people.map(p => [p.id, p.fullName || p.email])])}
+    <label class="chk"><input type="checkbox" id="f-mine" ${f.mine ? "checked" : ""}> Mine</label>
+    <span class="hint">${list.length} lead${list.length === 1 ? "" : "s"}</span></div>
+  <div class="panel">${list.length ? `<table><thead><tr><th>Lead</th><th>Contact details</th><th>Source</th><th>Status</th><th>Owner</th><th>Added</th></tr></thead><tbody>
+  ${list.map(l => `<tr class="click" data-open="leads:${l.id}"><td><span class="b">${esc(l.fullName)}</span><div class="hint">${esc(l.companyName || "")}</div></td>
+    <td>${esc(l.email || "")}<div class="hint">${esc(l.phone || "")}</div></td><td>${esc(l.source || "—")}</td><td>${leadPill(l)}</td>
+    <td>${esc(pname(l.ownerId) || "—")}</td><td><span class="hint">${ago(l.createdAt)}</span></td></tr>`).join("")}
+  </tbody></table>` : `<div class="empty">${inDept("leads", d).length ? "No leads match these filters" : "No leads yet. Add enquiries here, then convert the real ones into deals."}</div>`}</div>`;
+}
+
+/* ---------- Sales CRM: Activities & tasks ---------- */
+const taskLink = (k, here) => {
+  const t = k.ticketId !== here && k.ticketId && byId(S.tickets, k.ticketId), l = k.leadId !== here && k.leadId && lead(k.leadId), c = k.contactId && contact(k.contactId);
+  return t ? `<a href="#" data-jump="tickets:${t.id}">${esc(refLabel(t))} · ${esc(t.title)}</a>` : l ? `<a href="#" data-jump="leads:${l.id}">Lead: ${esc(l.fullName)}</a>` : c ? `<a href="#" data-jump="contacts:${c.id}">${esc(c.fullName)}</a>` : "";
+};
+const taskDue = k => k.done ? `<span class="hint">Done ${k.doneAt ? ago(k.doneAt) : ""}</span>` : !k.dueAt ? `<span class="hint">No due date</span>` : taskOverdue(k) ? `<span class="overdue">Overdue · ${fmtDT(k.dueAt)}</span>` : fmtDT(k.dueAt);
+const taskRows = (list, here) => list.map(k => `<div class="task ${k.done ? "done" : ""}" data-task="${k.id}">
+    <input type="checkbox" class="tdone" data-id="${k.id}" ${k.done ? "checked" : ""} aria-label="Mark ${esc(k.title)} done">
+    <div class="tmain"><span class="pill tk-${esc(k.kind || "task")}">${label(TASK_KINDS, k.kind || "task")}</span> <span class="b">${esc(k.title)}</span>
+      <div class="hint">${taskLink(k, here)}</div></div>
+    <div class="tdue">${taskDue(k)}<div class="hint">${esc(pname(k.ownerId) || "")}</div></div></div>`).join("");
+function vTasks(d) {
+  const f = boardF(d.id), q = f.q.toLowerCase(), people = peopleFor(d);
+  const list = inDept("tasks", d).filter(k => (!q || [k.title, k.notes, lead(k.leadId)?.fullName, byId(S.tickets, k.ticketId)?.title, contact(k.contactId)?.fullName].join(" ").toLowerCase().includes(q))
+    && (f.taskShow === "open" ? !k.done : f.taskShow === "overdue" ? taskOverdue(k) : f.taskShow === "today" ? taskDueToday(k) : f.taskShow === "done" ? k.done : true)
+    && (!f.taskOwner || (f.taskOwner === "me" ? k.ownerId === S.me.id : k.ownerId === f.taskOwner)))
+    .sort((a, b) => (a.done - b.done) || (a.done ? ts(b.doneAt || b.updatedAt) - ts(a.doneAt || a.updatedAt) : ts(a.dueAt || "2999-01-01") - ts(b.dueAt || "2999-01-01")));
+  return deptHead(d, `<button class="btn primary" data-act="newTask">+ New task</button>`) + `<div class="filters">
+    ${selBox("f-tshow", f.taskShow, [["open", "To do"], ["today", "Due today or earlier"], ["overdue", "Overdue"], ["done", "Done"], ["all", "All"]])}
+    ${selBox("f-towner", f.taskOwner, [["", "Anyone"], ["me", "Mine"], ...people.map(p => [p.id, p.fullName || p.email])])}
+    <span class="hint">${list.length} task${list.length === 1 ? "" : "s"}</span></div>
+  <div class="panel tasks">${list.length ? taskRows(list) : `<div class="empty">${inDept("tasks", d).length ? "Nothing here" : "No tasks yet. Plan your next calls, meetings and follow-ups."}</div>`}</div>`;
+}
+
+/* ---------- Support CRM: Assets ---------- */
+const assetPill = a => `<span class="pill as-${esc(a.status || "in_use")}">${label(ASSET_STATUSES, a.status || "in_use")}</span>`;
+function vAssets(d) {
+  const f = boardF(d.id), q = f.q.toLowerCase();
+  const all = inDept("assets", d);
+  const list = all.filter(a => (!q || [a.name, a.type, a.make, a.model, a.serial, a.site, company(a.companyId)?.name].join(" ").toLowerCase().includes(q))
+    && (!f.assetType || a.type === f.assetType) && (!f.assetCompany || a.companyId === f.assetCompany)
+    && (f.assetStatus === "active" ? a.status !== "retired" : !f.assetStatus || (a.status || "in_use") === f.assetStatus))
+    .sort((a, b) => (company(a.companyId)?.name || "~").localeCompare(company(b.companyId)?.name || "~") || a.name.localeCompare(b.name));
+  const comps = [...new Set(all.map(a => a.companyId).filter(Boolean))].map(company).filter(Boolean).sort((a, b) => a.name.localeCompare(b.name));
+  return deptHead(d, `<button class="btn" data-act="exportAssets">Export CSV</button><button class="btn primary" data-act="newAsset">+ New asset</button>`) + `<div class="filters">
+    ${selBox("f-astatus", f.assetStatus, [["active", "In service"], ["", "All"], ...ASSET_STATUSES])}
+    ${selBox("f-atype", f.assetType, [["", "All types"], ...ASSET_TYPES.map(x => [x, x])])}
+    ${selBox("f-acomp", f.assetCompany, [["", "All customers"], ...comps.map(c => [c.id, c.name])])}
+    <span class="hint">${list.length} asset${list.length === 1 ? "" : "s"}</span></div>
+  <div class="panel">${list.length ? `<table><thead><tr><th>Asset</th><th>Type</th><th>Customer / site</th><th>Serial</th><th>Status</th><th>Warranty</th><th>Open tickets</th></tr></thead><tbody>
+  ${list.map(a => { const open = S.tickets.filter(t => t.assetId === a.id && isOpen(t)).length; return `<tr class="click" data-open="assets:${a.id}"><td><span class="b">${esc(a.name)}</span><div class="hint">${esc([a.make, a.model].filter(Boolean).join(" "))}</div></td>
+    <td>${esc(a.type || "—")}</td><td>${esc(company(a.companyId)?.name || "—")}<div class="hint">${esc(a.site || "")}</div></td><td class="id">${esc(a.serial || "—")}</td><td>${assetPill(a)}</td>
+    <td>${a.warrantyUntil ? `<span class="${warrantyOver(a) ? "overdue" : ""}">${warrantyOver(a) ? "Ended " : "Until "}${fmtDate(a.warrantyUntil)}</span>` : "—"}</td><td>${open || ""}</td></tr>`; }).join("")}
+  </tbody></table>` : `<div class="empty">${all.length ? "No assets match these filters" : "No assets yet. Add the tills, tablets, printers and routers you look after."}</div>`}</div>`;
+}
+
+/* ---------- Support CRM: Knowledge base ---------- */
+function vKB(d) {
+  const f = boardF(d.id), q = f.q.toLowerCase();
+  const list = inDept("articles", d).filter(a => (!q || [a.title, a.body, a.tags, a.category].join(" ").toLowerCase().includes(q)) && (!f.kbCat || a.category === f.kbCat))
+    .sort((a, b) => ts(b.updatedAt) - ts(a.updatedAt));
+  return deptHead(d, `<button class="btn primary" data-act="newArticle">+ New article</button>`) + `<div class="filters">
+    ${selBox("f-kbcat", f.kbCat, [["", "All categories"], ...KB_CATEGORIES.map(x => [x, x])])}
+    <span class="hint">${list.length} article${list.length === 1 ? "" : "s"}</span></div>
+  ${list.length ? `<div class="kb">${list.map(a => `<button class="kbcard" data-open="articles:${a.id}"><span class="pill">${esc(a.category || "Article")}</span>
+    <span class="kbt">${esc(a.title)}</span><span class="kbs">${esc(a.body.slice(0, 160))}${a.body.length > 160 ? "…" : ""}</span>
+    <span class="hint">Updated ${ago(a.updatedAt)}${a.updatedBy || a.createdBy ? " by " + esc(pname(a.updatedBy || a.createdBy)) : ""}</span></button>`).join("")}</div>`
+    : `<div class="panel"><div class="empty">${inDept("articles", d).length ? "No articles match" : "No articles yet. Write down fixes your team keeps repeating, so anyone can solve them next time."}</div></div>`}`;
+}
+// Articles that look relevant to a ticket: share a meaningful word with its subject or category
+function suggestedArticles(t) {
+  const words = new Set(`${t.title} ${t.category || ""}`.toLowerCase().split(/[^a-z0-9]+/).filter(w => w.length > 3));
+  if (!words.size) return [];
+  return S.articles.filter(a => a.departmentId === t.departmentId).map(a => {
+    const aw = `${a.title} ${a.tags || ""} ${a.category || ""}`.toLowerCase().split(/[^a-z0-9]+/);
+    return [a, aw.filter(w => words.has(w)).length];
+  }).filter(([, n]) => n > 0).sort((x, y) => y[1] - x[1]).slice(0, 3).map(([a]) => a);
+}
+
 function filteredContacts() {
   const q = F.contacts.q.toLowerCase();
   return S.contacts.filter(c => (!q || [c.fullName, c.email, c.phone, c.jobTitle, company(c.companyId)?.name].join(" ").toLowerCase().includes(q))
@@ -573,13 +720,13 @@ function vCompanies() {
 
 function vDepartments() {
   const members = d => S.staff ? S.staff.filter(u => (u.departments || []).includes(d.groupName)).length : (d.memberIds || []).length;
-  return `<div class="head"><div><h1>Departments</h1><div class="sub">Each department has its own board. People only see the departments you add them to.</div></div><span class="spacer"></span>
+  return `<div class="head"><div><h1>Departments</h1><div class="sub">Each department is its own CRM: Sales CRM or IT support CRM. People only see the departments you add them to.</div></div><span class="spacer"></span>
     <button class="btn primary" data-act="newDept">+ New department</button></div>
   <div class="panel">${S.departments.length ? `<table><thead><tr><th>Department</th><th>Type</th><th>Ticket prefix</th><th>Members</th><th>Open</th><th>Total</th><th></th></tr></thead><tbody>
   ${depts().map(d => `<tr><td>${deptTag(d)}${d.description ? `<div class="hint">${esc(d.description)}</div>` : ""}</td><td>${label(KINDS, d.kind)}</td><td class="id">${esc(d.code)}-1001</td><td>${members(d)}</td>
     <td>${ticketsIn(d).filter(isOpen).length}</td><td>${ticketsIn(d).length}</td>
     <td style="text-align:right"><a class="btn sm" href="#d-${d.id}">Open</a> <button class="btn sm" data-editdept="${d.id}">Edit</button></td></tr>`).join("")}
-  </tbody></table>` : `<div class="empty">No departments yet. Typical setup: <b>Sales</b> (pipeline), <b>IT Support</b> (support queue), <b>Customer Service</b> (support queue).</div>`}</div>`;
+  </tbody></table>` : `<div class="empty">No departments yet. Typical setup: <b>Sales</b> (Sales CRM), <b>IT Support</b> (IT support CRM), <b>Customer Service</b> (IT support CRM).</div>`}</div>`;
 }
 
 function vTeam() {
@@ -610,7 +757,9 @@ function bindMain() {
   const acts = {
     newTicket: () => chooseDept(d => formTicket(null, d)), newInDept: () => formTicket(null, dept(viewDept)),
     newContact: () => formContact(), newCompany: () => formCompany(), newDept: () => formDept(), invite: () => formInvite(),
-    exportBoard, exportContacts,
+    newLead: () => formLead(null, dept(viewDept)), newTask: () => formTask(null, dept(viewDept)),
+    newAsset: () => formAsset(null, dept(viewDept)), newArticle: () => formArticle(null, dept(viewDept)),
+    exportBoard, exportContacts, exportAssets,
   };
   m.querySelectorAll("[data-act]").forEach(b => b.onclick = () => acts[b.dataset.act]());
   m.querySelectorAll("[data-open]").forEach(r => r.addEventListener("click", () => { const [t, id] = r.dataset.open.split(":"); openDrawer(t, id); }));
@@ -620,7 +769,11 @@ function bindMain() {
     const f = boardF(viewDept);
     on("f-q", v => f.q = v); on("f-status", v => f.status = v, "change"); on("f-prio", v => f.priority = v, "change"); on("f-assignee", v => f.assignee = v, "change");
     on("f-owner", v => f.owner = v, "change"); on("f-mine", v => f.mine = v, "change"); on("f-age", v => { f.age = v; selected.clear(); }, "change");
+    on("f-lstatus", v => f.leadStatus = v, "change"); on("f-tshow", v => f.taskShow = v, "change"); on("f-towner", v => f.taskOwner = v, "change");
+    on("f-astatus", v => f.assetStatus = v, "change"); on("f-atype", v => f.assetType = v, "change"); on("f-acomp", v => f.assetCompany = v, "change"); on("f-kbcat", v => f.kbCat = v, "change");
   }
+  bindTasks(m);
+  m.querySelectorAll("[data-jump]").forEach(x => x.addEventListener("click", e => { e.preventDefault(); e.stopPropagation(); const [t, i] = x.dataset.jump.split(":"); openDrawer(t, i); }));
   on("f-cq", v => F.contacts.q = v); on("f-cc", v => F.contacts.company = v, "change"); on("f-oq", v => F.companies.q = v);
 
   // bulk selection (managers)
@@ -777,12 +930,13 @@ async function resolveContact(o) {
   delete o.newContact; delete o.newContactEmail; return true;
 }
 
-function formTicket(t, d) {
+function formTicket(t, d, preset = {}) {
   const isNew = !t; d = d || deptOf(t);
   if (!d) return toast("Choose a department", true);
   const people = [["", "— Unassigned —"], ...peopleFor(d).map(p => [p.id, p.fullName || p.email])];
   const pipe = d.kind === "pipeline";
-  const rec = t || (pipe ? { stage: "new", assigneeId: S.me.id } : { status: "open", priority: "normal" });
+  const rec = t || (pipe ? { stage: "new", assigneeId: S.me.id, ...preset } : { status: "open", priority: "normal", ...preset });
+  const assets = [["", "— None —"], ...inDept("assets", d).filter(a => a.status !== "retired" || a.id === t?.assetId).sort((a, b) => a.name.localeCompare(b.name)).map(a => [a.id, a.name + (company(a.companyId) ? " · " + company(a.companyId).name : "") + (a.serial ? " · " + a.serial : "")])];
   const fields = pipe ? [
     { k: "title", label: "Deal / opportunity", req: true },
     { k: "contactId", label: "Contact", type: "select", opts: contactOpts(), half: true },
@@ -800,6 +954,7 @@ function formTicket(t, d) {
     ...newContactFields,
     { k: "category", label: "Category", type: "select", opts: ["", ...CATEGORIES], half: true }, { k: "priority", label: "Priority", type: "select", opts: PRIOS, half: true },
     { k: "status", label: "Status", type: "select", opts: STATUSES, half: true }, { k: "assigneeId", label: "Assignee", type: "select", opts: people, half: true },
+    { k: "assetId", label: "Device / asset", type: "select", opts: assets, hint: assets.length > 1 ? "" : "Add devices under this department's Assets tab" },
     { k: "description", label: "Description", type: "textarea" },
   ];
   modal(`${isNew ? (pipe ? "New deal" : "New ticket") : "Edit " + refLabel(t)} · ${esc(d.name)}`, fields, rec, async o => {
@@ -807,7 +962,7 @@ function formTicket(t, d) {
     const common = { title: o.title, contactId: nul(o.contactId), companyId: nul(o.companyId), assigneeId: nul(o.assigneeId), description: nul(o.description) };
     const row = pipe
       ? { ...common, value: Number(o.value) || 0, stage: o.stage, expectedClose: nul(o.expectedClose), source: nul(o.source), lostReason: o.stage === "lost" ? nul(o.lostReason) : null }
-      : { ...common, category: nul(o.category), priority: o.priority, status: o.status };
+      : { ...common, category: nul(o.category), priority: o.priority, status: o.status, assetId: nul(o.assetId) };
     if (isNew) row.departmentId = d.id;
     const r = await saveTicket(isNew ? null : t, row);
     if (!r) return false; toast(isNew ? `${refLabel(r)} created` : "Saved"); if (isNew) openDrawer("tickets", r.id);
@@ -840,10 +995,10 @@ function formCompany(c) {
   });
 }
 function formDept(d) {
-  const isNew = !d, used = d ? ticketsIn(d).length : 0;
+  const isNew = !d, used = d ? deptRecords(d) : 0;
   modal(isNew ? "New department" : "Edit " + esc(d.name), [
     { k: "name", label: "Department name", req: true, hint: "e.g. Sales, IT Support, Accounts, Customer Service" },
-    { k: "kind", label: "Type", type: "select", opts: KINDS, half: true, disabled: used > 0, hint: used ? "Can't change: it already has tickets" : "Support queue: priorities and SLA timers. Sales pipeline: deal values and stages." },
+    { k: "kind", label: "Type", type: "select", opts: KINDS, half: true, disabled: used > 0, hint: used ? "Can't change: it already has records" : "Sales CRM: leads, deals pipeline, activities & tasks. IT support CRM: tickets with SLA timers, assets, knowledge base." },
     { k: "code", label: "Ticket prefix", req: true, max: 6, half: true, hint: "Short code, e.g. IT → IT-1001" },
     { k: "color", label: "Colour", type: "colors" },
     { k: "description", label: "Description (optional)" },
@@ -861,12 +1016,133 @@ function formDept(d) {
   }, isNew ? null : {
     label: "Delete department",
     onClick: async () => {
-      if (ticketsIn(d).length) { toast(`Move or delete its ${ticketsIn(d).length} ticket(s) first`, true); return false; }
+      if (deptRecords(d)) { toast(`Move or delete its ${deptRecords(d)} record(s) first (tickets, leads, tasks, assets, articles)`, true); return false; }
       if (!(await rem("departments", d.id))) return false;
       try { await callAdmin("removeDepartmentGroup", { groupName: d.groupName }); } catch (e) { console.warn(e); }
       toast("Department deleted"); loadStaff();
     },
   });
+}
+
+/* ---------- Sales CRM & Support CRM forms ---------- */
+// Task lists (department tab and inside a deal or lead): tick to complete, click to edit
+function bindTasks(root) {
+  root.querySelectorAll(".tdone").forEach(cb => { cb.addEventListener("click", e => e.stopPropagation()); cb.onchange = () => toggleTask(byId(S.tasks, cb.dataset.id), cb.checked); });
+  root.querySelectorAll("[data-task]").forEach(row => row.addEventListener("click", e => { if (!e.target.closest("[data-jump]")) formTask(byId(S.tasks, row.dataset.task)); }));
+}
+async function toggleTask(k, done) {
+  if (!k) return;
+  const r = await upd("tasks", k.id, { done, doneAt: done ? nowISO() : null });
+  if (!r) return;
+  const deal = done && k.ticketId && byId(S.tickets, k.ticketId);
+  if (deal) await logActivity(deal, `Done: ${label(TASK_KINDS, k.kind || "task")}: ${k.title}`, ["call", "email", "meeting"].includes(k.kind) ? k.kind : "note");
+  toast(done ? "Task done" : "Task reopened");
+  if (openRec) drawDrawer();
+}
+function formTask(k, d, preset = {}) {
+  const isNew = !k; d = d || dept(k?.departmentId);
+  if (!d) return toast("Choose a department", true);
+  const people = [["", "— Nobody —"], ...peopleFor(d).map(p => [p.id, p.fullName || p.email])];
+  const deals = [["", "— None —"], ...ticketsIn(d).filter(t => isOpen(t) || t.id === k?.ticketId).map(t => [t.id, `${refLabel(t)} · ${t.title}`])];
+  const leads = [["", "— None —"], ...inDept("leads", d).filter(l => l.status !== "converted" || l.id === k?.leadId).map(l => [l.id, l.fullName + (l.companyName ? " · " + l.companyName : "")])];
+  const local = v => v ? new Date(ts(v) - new Date().getTimezoneOffset() * 6e4).toISOString().slice(0, 16) : "";
+  const rec = k ? { ...k, dueAt: local(k.dueAt) } : { kind: "call", ownerId: S.me.id, dueAt: local(new Date(Date.now() + 864e5).setHours(10, 0, 0, 0)), ...preset };
+  modal(`${isNew ? "New task" : "Edit task"} · ${esc(d.name)}`, [
+    { k: "title", label: "What needs doing", req: true, hint: "e.g. Call back about the quote" },
+    { k: "kind", label: "Type", type: "select", opts: TASK_KINDS, half: true }, { k: "dueAt", label: "Due", type: "datetime-local", half: true },
+    { k: "ownerId", label: "Who", type: "select", opts: people, half: true }, { k: "ticketId", label: "Deal", type: "select", opts: deals, half: true },
+    { k: "leadId", label: "Lead", type: "select", opts: leads, half: true }, { k: "contactId", label: "Contact", type: "select", opts: contactOpts().filter(o => o[0] !== NEW), half: true },
+    { k: "notes", label: "Notes", type: "textarea" },
+  ], rec, async o => {
+    const row = { title: o.title, kind: o.kind, dueAt: o.dueAt ? new Date(o.dueAt).toISOString() : null, ownerId: nul(o.ownerId), ticketId: nul(o.ticketId), leadId: nul(o.leadId), contactId: nul(o.contactId), notes: nul(o.notes) };
+    const r = isNew ? await ins("tasks", { ...row, departmentId: d.id, departmentGroup: d.groupName, done: false, createdBy: S.me.id }) : await upd("tasks", k.id, row);
+    if (!r) return false; toast(isNew ? "Task added" : "Task saved"); if (openRec) drawDrawer();
+  }, !isNew && isManager() ? { label: "Delete task", onClick: async () => { if (!(await rem("tasks", k.id))) return false; toast("Task deleted"); if (openRec) drawDrawer(); } } : null);
+}
+
+function formLead(l, d) {
+  const isNew = !l; d = d || dept(l?.departmentId);
+  if (!d) return toast("Choose a department", true);
+  const people = [["", "— Nobody —"], ...peopleFor(d).map(p => [p.id, p.fullName || p.email])];
+  modal(`${isNew ? "New lead" : "Edit lead"} · ${esc(d.name)}`, [
+    { k: "fullName", label: "Name", req: true, half: true }, { k: "companyName", label: "Business / company", half: true },
+    { k: "email", label: "Email", type: "email", half: true }, { k: "phone", label: "Phone", type: "tel", half: true },
+    { k: "source", label: "Where they came from", list: SOURCES, half: true }, { k: "status", label: "Status", type: "select", opts: LEAD_STATUSES.filter(x => x[0] !== "converted" || l?.status === "converted"), half: true },
+    { k: "ownerId", label: "Owner", type: "select", opts: people },
+    { k: "notes", label: "Notes", type: "textarea", hint: "What they're after, budget, timing…" },
+  ], l || { status: "new", ownerId: S.me.id }, async o => {
+    const row = { fullName: o.fullName, companyName: nul(o.companyName), email: nul(o.email), phone: nul(o.phone), source: nul(o.source), status: o.status || "new", ownerId: nul(o.ownerId), notes: nul(o.notes) };
+    const r = isNew ? await ins("leads", { ...row, departmentId: d.id, departmentGroup: d.groupName, createdBy: S.me.id }) : await upd("leads", l.id, row);
+    if (!r) return false; toast(isNew ? "Lead added" : "Lead saved"); if (isNew) openDrawer("leads", r.id);
+  });
+}
+
+// Lead → contact (+ company, reusing one with the same name) + a deal in the same department. Its open tasks move to the deal.
+function convertLead(l) {
+  const d = dept(l.departmentId);
+  if (!d) return;
+  const people = [["", "— Unassigned —"], ...peopleFor(d).map(p => [p.id, p.fullName || p.email])];
+  modal(`Convert ${esc(l.fullName)} to a deal`, [
+    { k: "_i", type: "info", label: "This will", html: `<span class="hint">Create a contact for ${esc(l.fullName)}${l.companyName ? ` at ${esc(l.companyName)}` : ""} and a deal in ${esc(d.name)}. Their open tasks move to the deal.</span>` },
+    { k: "title", label: "Deal name", req: true },
+    { k: "value", label: "Value (£)", type: "number", half: true }, { k: "expectedClose", label: "Expected close", type: "date", half: true },
+    { k: "stage", label: "Stage", type: "select", opts: STAGES.filter(x => !["won", "lost"].includes(x[0])), half: true }, { k: "assigneeId", label: "Owner", type: "select", opts: people, half: true },
+  ], { title: l.companyName || l.fullName, stage: "qualified", assigneeId: l.ownerId || S.me.id }, async o => {
+    let companyId = null;
+    if (l.companyName) {
+      const same = S.companies.find(c => c.name.trim().toLowerCase() === l.companyName.trim().toLowerCase());
+      const c = same || await ins("companies", { name: l.companyName.trim(), createdBy: S.me.id });
+      if (!c) return false; companyId = c.id;
+    }
+    const sameContact = l.email && S.contacts.find(c => (c.email || "").toLowerCase() === l.email.toLowerCase());
+    const c = sameContact || await ins("contacts", { fullName: l.fullName, email: nul(l.email), phone: nul(l.phone), companyId, notes: nul(l.notes), createdBy: S.me.id });
+    if (!c) return false;
+    const deal = await saveTicket(null, { departmentId: d.id, title: o.title, value: Number(o.value) || 0, stage: o.stage, expectedClose: nul(o.expectedClose), assigneeId: nul(o.assigneeId), contactId: c.id, companyId: companyId || c.companyId || null, source: nul(l.source), description: nul(l.notes), leadId: l.id });
+    if (!deal) return false;
+    await upd("leads", l.id, { status: "converted", convertedAt: nowISO(), convertedTicketId: deal.id, convertedContactId: c.id });
+    for (const k of S.tasks.filter(x => x.leadId === l.id && !x.done)) await upd("tasks", k.id, { ticketId: deal.id });
+    await logActivity(deal, `Converted from lead ${l.fullName}`);
+    toast(`${refLabel(deal)} created from the lead`);
+    setTimeout(() => openDrawer("tickets", deal.id), 0);
+  });
+}
+
+function formAsset(a, d, preset = {}) {
+  const isNew = !a; d = d || dept(a?.departmentId);
+  if (!d) return toast("Choose a department", true);
+  modal(`${isNew ? "New asset" : "Edit asset"} · ${esc(d.name)}`, [
+    { k: "name", label: "Name", req: true, half: true, hint: "e.g. Front till, Kitchen printer 2" }, { k: "type", label: "Type", type: "select", opts: ["", ...ASSET_TYPES], half: true },
+    { k: "companyId", label: "Customer", type: "select", opts: companyOpts(), half: true }, { k: "site", label: "Site / location", half: true, hint: "e.g. Soho branch, bar area" },
+    { k: "make", label: "Make", half: true }, { k: "model", label: "Model", half: true },
+    { k: "serial", label: "Serial number", half: true }, { k: "status", label: "Status", type: "select", opts: ASSET_STATUSES, half: true },
+    { k: "installedOn", label: "Installed on", type: "date", half: true }, { k: "warrantyUntil", label: "Warranty until", type: "date", half: true },
+    { k: "contactId", label: "Contact on site", type: "select", opts: contactOpts().filter(o => o[0] !== NEW) },
+    { k: "notes", label: "Notes", type: "textarea", hint: "IP address, login location, cabling… (never passwords)" },
+  ], a || { status: "in_use", ...preset }, async o => {
+    const row = { name: o.name, type: nul(o.type), companyId: nul(o.companyId), site: nul(o.site), make: nul(o.make), model: nul(o.model), serial: nul(o.serial), status: o.status || "in_use", installedOn: nul(o.installedOn), warrantyUntil: nul(o.warrantyUntil), contactId: nul(o.contactId), notes: nul(o.notes) };
+    const r = isNew ? await ins("assets", { ...row, departmentId: d.id, departmentGroup: d.groupName, createdBy: S.me.id }) : await upd("assets", a.id, row);
+    if (!r) return false; toast(isNew ? "Asset added" : "Asset saved"); if (isNew) openDrawer("assets", r.id);
+  });
+}
+
+function formArticle(a, d) {
+  const isNew = !a; d = d || dept(a?.departmentId);
+  if (!d) return toast("Choose a department", true);
+  modal(`${isNew ? "New article" : "Edit article"} · ${esc(d.name)}`, [
+    { k: "title", label: "Title", req: true, hint: "Say the problem the way a customer would, e.g. Receipt printer prints blank" },
+    { k: "category", label: "Category", type: "select", opts: ["", ...KB_CATEGORIES], half: true }, { k: "tags", label: "Keywords", half: true, hint: "Comma separated, e.g. printer, paper" },
+    { k: "body", label: "Steps / answer", type: "textarea", req: true },
+  ], a || { category: "Known fix" }, async o => {
+    if (!o.body) { toast("Write the steps or answer", true); return false; }
+    const row = { title: o.title, category: nul(o.category), tags: nul(o.tags), body: o.body, updatedBy: S.me.id };
+    const r = isNew ? await ins("articles", { ...row, departmentId: d.id, departmentGroup: d.groupName, createdBy: S.me.id }) : await upd("articles", a.id, row);
+    if (!r) return false; toast(isNew ? "Article published" : "Article saved"); if (isNew) openDrawer("articles", r.id);
+  });
+}
+function exportAssets() {
+  const d = dept(viewDept); if (!d) return;
+  csv(d.name.toLowerCase().replace(/[^a-z0-9]+/g, "-") + "-assets", ["Name", "Type", "Customer", "Site", "Make", "Model", "Serial", "Status", "Installed", "Warranty until"],
+    inDept("assets", d).map(a => [a.name, a.type, company(a.companyId)?.name, a.site, a.make, a.model, a.serial, label(ASSET_STATUSES, a.status || "in_use"), a.installedOn, a.warrantyUntil]));
 }
 
 /* ---------- drawer ---------- */
@@ -888,6 +1164,15 @@ async function refreshDrawer(withActivity) {
   if (!openRec) return;
   if (withActivity) { drawDrawer(); await loadActivity(); }
   drawDrawer();
+}
+
+// Tasks inside a deal or lead
+const taskSection = (list, what, here) => `<div class="feed tasks-in"><h4>Tasks (${list.filter(k => !k.done).length} to do) <button class="btn sm" id="addtask" style="margin-left:8px">+ Task</button></h4>
+  ${list.length ? `<div class="tasks">${taskRows([...list].sort((a, b) => (a.done - b.done) || ts(a.dueAt || "2999-01-01") - ts(b.dueAt || "2999-01-01")), here)}</div>` : `<div class="hint">No tasks for this ${what} yet</div>`}</div><div style="height:14px"></div>`;
+// Knowledge base articles that may answer a support ticket
+function articleSuggestions(t) {
+  const list = suggestedArticles(t);
+  return list.length ? `<div class="feed"><h4>Might help (knowledge base)</h4>${list.map(a => `<div class="linked" data-jump="articles:${a.id}"><span class="pill">${esc(a.category || "Article")}</span><span>${esc(a.title)}</span></div>`).join("")}</div><div style="height:14px"></div>` : "";
 }
 
 function drawDrawer() {
@@ -914,7 +1199,8 @@ function drawDrawer() {
         <span class="k">Company</span><span>${linkO(r.companyId)}</span>
         <span class="k">Expected close</span><span>${fmtDate(r.expectedClose)}</span>
         <span class="k">Source</span><span>${esc(r.source || "—")}</span>
-        ${r.stage === "lost" && r.lostReason ? `<span class="k">Reason lost</span><span>${esc(r.lostReason)}</span>` : ""}`
+        ${r.stage === "lost" && r.lostReason ? `<span class="k">Reason lost</span><span>${esc(r.lostReason)}</span>` : ""}
+        ${r.leadId && lead(r.leadId) ? `<span class="k">From lead</span><span><a href="#" data-jump="leads:${r.leadId}">${esc(lead(r.leadId).fullName)}</a></span>` : ""}`
       : `
         <span class="k">Status</span>${sel("tstatus", r.status, STATUSES)}
         <span class="k">Priority</span>${sel("tprio", r.priority, PRIOS)}
@@ -922,10 +1208,12 @@ function drawDrawer() {
         <span class="k">Requester</span><span>${linkC(r.contactId)}${contact(r.contactId)?.email ? `<div class="hint">${esc(contact(r.contactId).email)}</div>` : ""}</span>
         <span class="k">Company</span><span>${linkO(r.companyId)}</span>
         <span class="k">Category</span><span>${esc(r.category || "—")}</span>
+        <span class="k">Device</span><span>${asset(r.assetId) ? `<a href="#" data-jump="assets:${r.assetId}">${esc(asset(r.assetId).name)}</a>${asset(r.assetId).serial ? `<div class="hint">${esc(asset(r.assetId).serial)}</div>` : ""}` : "—"}</span>
         <span class="k">SLA due</span><span class="${isOverdue(r) ? "overdue" : ""}">${fmtDT(r.slaDue)}${isOverdue(r) ? " · overdue" : ""}</span>
         ${r.resolvedAt ? `<span class="k">Resolved</span><span>${fmtDT(r.resolvedAt)}</span>` : ""}`}
       <span class="k">Created</span><span>${fmtDT(r.createdAt)}${r.createdBy ? " by " + esc(pname(r.createdBy)) : ""}</span></div>
       ${r.description ? `<div class="desc">${esc(r.description)}</div>` : ""}
+      ${pipe ? taskSection(S.tasks.filter(k => k.ticketId === r.id), "deal", r.id) : articleSuggestions(r)}
       <div class="feed"><h4>Activity</h4>
       <div class="addnote"><textarea id="nt" placeholder="${pipe ? "Log a note, call, email or meeting…" : "Add an internal note or update…"}">${esc(draft)}</textarea>
       <div class="row">${pipe ? sel("nk", draftKind, NOTE_KINDS) : ""}<span class="spacer"></span><button class="btn primary sm" id="addn">Add</button></div></div>
@@ -946,12 +1234,43 @@ function drawDrawer() {
       ${r.notes ? `<div class="desc">${esc(r.notes)}</div>` : ""}
       <div class="feed"><h4>Contacts (${cs.length}) <button class="btn sm" id="addcc" style="margin-left:8px">+ Add</button></h4>${cs.map(c => `<div class="linked" data-jump="contacts:${c.id}"><span class="b">${esc(c.fullName)}</span><span class="hint">${esc(c.jobTitle || c.email || "")}</span></div>`).join("") || `<div class="hint">None</div>`}</div>
       <div style="height:14px"></div>${linkedTickets(S.tickets.filter(t => t.companyId === r.id))}</div>`;
+  } else if (table === "leads") {
+    const d = dept(r.departmentId), people = [["", "— Nobody —"], ...peopleFor(d).map(p => [p.id, p.fullName || p.email])];
+    const deal = r.convertedTicketId && byId(S.tickets, r.convertedTicketId);
+    h = `<header><span class="tag" style="color:${esc(d?.color || "inherit")}">${esc(d?.name || "")} · Lead</span><h2>${esc(r.fullName)}</h2><div class="hint">${esc(r.companyName || "")}</div></header><div class="body">
+      ${r.status === "converted" ? `<div class="msg ok">Converted ${r.convertedAt ? fmtDate(r.convertedAt) : ""}${deal ? ` into <a href="#" data-jump="tickets:${deal.id}">${esc(refLabel(deal))} · ${esc(deal.title)}</a>` : ""}.</div>` : `<div class="convert"><button class="btn primary" id="lconvert">Convert to deal</button><span class="hint">Creates the contact and a deal</span></div>`}
+      <div class="kv"><span class="k">Status</span>${r.status === "converted" ? leadPill(r) : sel("lstatus", r.status || "new", LEAD_STATUSES.filter(x => x[0] !== "converted"))}
+      <span class="k">Owner</span>${sel("lowner", r.ownerId || "", people)}
+      <span class="k">Email</span><span>${r.email ? `<a href="mailto:${esc(r.email)}">${esc(r.email)}</a>` : "—"}</span>
+      <span class="k">Phone</span><span>${r.phone ? `<a href="tel:${esc(r.phone)}">${esc(r.phone)}</a>` : "—"}</span>
+      <span class="k">Source</span><span>${esc(r.source || "—")}</span>
+      <span class="k">Added</span><span>${fmtDT(r.createdAt)}${r.createdBy ? " by " + esc(pname(r.createdBy)) : ""}</span></div>
+      ${r.notes ? `<div class="desc">${esc(r.notes)}</div>` : ""}
+      ${taskSection(S.tasks.filter(k => k.leadId === r.id), "lead", r.id)}</div>`;
+  } else if (table === "assets") {
+    const d = dept(r.departmentId), tickets = S.tickets.filter(t => t.assetId === r.id);
+    h = `<header><span class="tag" style="color:${esc(d?.color || "inherit")}">${esc(d?.name || "")} · ${esc(r.type || "Asset")}</span><h2>${esc(r.name)}</h2><div class="hint">${esc([r.make, r.model].filter(Boolean).join(" "))}</div></header><div class="body">
+      <div class="kv"><span class="k">Status</span><span>${assetPill(r)}</span>
+      <span class="k">Customer</span><span>${linkO(r.companyId)}</span>
+      <span class="k">Site</span><span>${esc(r.site || "—")}</span>
+      <span class="k">Contact on site</span><span>${linkC(r.contactId)}</span>
+      <span class="k">Serial number</span><span class="id">${esc(r.serial || "—")}</span>
+      <span class="k">Installed</span><span>${fmtDate(r.installedOn)}</span>
+      <span class="k">Warranty</span><span class="${warrantyOver(r) ? "overdue" : ""}">${r.warrantyUntil ? (warrantyOver(r) ? "Ended " : "Until ") + fmtDate(r.warrantyUntil) : "—"}</span></div>
+      ${r.notes ? `<div class="desc">${esc(r.notes)}</div>` : ""}
+      <div class="feed"><h4>Tickets for this device (${tickets.length}) <button class="btn sm" id="anewticket" style="margin-left:8px">+ New ticket</button></h4>${sortByUrgency(tickets).map(t => `<div class="linked" data-jump="tickets:${t.id}"><span class="id">${esc(refLabel(t))}</span><span>${esc(t.title)}</span><span class="spacer"></span><span class="pill st-${t.status}">${label(STATUSES, t.status)}</span></div>`).join("") || `<div class="hint">No tickets yet</div>`}</div></div>`;
+  } else if (table === "articles") {
+    const d = dept(r.departmentId);
+    h = `<header><span class="tag" style="color:${esc(d?.color || "inherit")}">${esc(d?.name || "")} · ${esc(r.category || "Article")}</span><h2>${esc(r.title)}</h2>
+      <div class="hint">Updated ${fmtDT(r.updatedAt)}${r.updatedBy || r.createdBy ? " by " + esc(pname(r.updatedBy || r.createdBy)) : ""}</div></header><div class="body">
+      <div class="article">${esc(r.body)}</div>
+      ${r.tags ? `<div class="chips" style="margin-top:14px">${r.tags.split(",").map(x => x.trim()).filter(Boolean).map(x => `<span class="pill">${esc(x)}</span>`).join("")}</div>` : ""}</div>`;
   }
   h += `<div class="foot"><button class="btn" id="dedit">Edit</button>${canDelete ? `<button class="btn danger" id="ddel">Delete</button>` : ""}<span class="spacer"></span><button class="btn" id="dclose">Close</button></div>`;
   dr.innerHTML = h;
 
   $("#dclose").onclick = closeDrawer;
-  $("#dedit").onclick = () => ({ tickets: t => formTicket(t), contacts: formContact, companies: formCompany })[table](r);
+  $("#dedit").onclick = () => ({ tickets: t => formTicket(t), contacts: formContact, companies: formCompany, leads: x => formLead(x), assets: x => formAsset(x), articles: x => formArticle(x) })[table](r);
   const delb = $("#ddel");
   if (delb) delb.onclick = async () => {
     if (!delb.classList.contains("armed")) { delb.classList.add("armed"); delb.textContent = "Click again to delete"; setTimeout(() => { if (document.body.contains(delb)) { delb.classList.remove("armed"); delb.textContent = "Delete"; } }, 3000); return; }
@@ -959,6 +1278,12 @@ function drawDrawer() {
   };
   dr.querySelectorAll("[data-jump]").forEach(x => x.onclick = e => { e.preventDefault(); const [t, i] = x.dataset.jump.split(":"); openDrawer(t, i); });
   $("#addcc")?.addEventListener("click", () => formContact(null, { companyId: r.id }));
+  bindTasks(dr);
+  $("#addtask")?.addEventListener("click", () => formTask(null, dept(r.departmentId), table === "leads" ? { leadId: r.id, contactId: r.convertedContactId || null } : { ticketId: r.id, contactId: r.contactId || null }));
+  $("#lconvert")?.addEventListener("click", () => convertLead(r));
+  $("#lstatus")?.addEventListener("change", async e => { if (await upd("leads", r.id, { status: e.target.value })) toast("Lead updated"); });
+  $("#lowner")?.addEventListener("change", async e => { if (await upd("leads", r.id, { ownerId: e.target.value || null })) toast("Owner changed"); });
+  $("#anewticket")?.addEventListener("click", () => formTicket(null, dept(r.departmentId), { assetId: r.id, companyId: r.companyId || "", contactId: r.contactId || "" }));
   const change = (sid, field) => $("#" + sid)?.addEventListener("change", async e => {
     const r2 = await saveTicket(r, { [field]: e.target.value || null });
     if (r2 && field === "departmentId") toast(`Moved to ${deptOf(r2)?.name}`);

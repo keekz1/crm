@@ -6,6 +6,9 @@ import { adminUsers } from "./admin-users/resource";
  *   Department        -> MANAGERS: everything. Members: read only the departments they belong to.
  *   Ticket, activity  -> MANAGERS: everything. Members: only records whose departmentGroup is one
  *                        of their Cognito groups. Only MANAGERS can delete.
+ *   Lead, SalesTask   -> Sales CRM departments (kind "pipeline"): same rule as tickets.
+ *   Asset, Article    -> Support CRM departments (kind "support"): same rule as tickets.
+ *                        Nothing is ever deleted except by a MANAGER; everyone else can only add and edit.
  *   Company, Contact  -> shared customer directory for all approved staff; only MANAGERS delete.
  *   Profile           -> each user manages their own; staff can read names.
  * Users in no group ("pending") can only read their own Profile.
@@ -55,6 +58,8 @@ const schema = a.schema({
       source: a.string(),
       lostReason: a.string(),
       closedAt: a.datetime(),
+      leadId: a.id(), // the lead this deal was converted from
+      assetId: a.id(), // support: the device the ticket is about
       createdBy: a.string(),
     })
     .authorization((allow) => [
@@ -73,6 +78,94 @@ const schema = a.schema({
     .authorization((allow) => [
       allow.groups(["MANAGERS"]),
       allow.groupDefinedIn("departmentGroup").to(["create", "read"]),
+    ]),
+
+  /* ---------- Sales CRM ---------- */
+  // A new enquiry, not yet a deal. Converting it creates a contact (and company) plus a deal.
+  Lead: a
+    .model({
+      departmentId: a.id().required(),
+      departmentGroup: a.string().required(),
+      fullName: a.string().required(),
+      companyName: a.string(),
+      email: a.string(),
+      phone: a.string(),
+      source: a.string(),
+      status: a.string(), // new | contacted | qualified | unqualified | converted
+      ownerId: a.string(),
+      notes: a.string(),
+      convertedAt: a.datetime(),
+      convertedTicketId: a.id(),
+      convertedContactId: a.id(),
+      createdBy: a.string(),
+    })
+    .authorization((allow) => [
+      allow.groups(["MANAGERS"]),
+      allow.groupDefinedIn("departmentGroup").to(["create", "read", "update"]),
+    ]),
+
+  // Calls, meetings, emails and to-dos with a due date, optionally linked to a deal, lead or contact.
+  SalesTask: a
+    .model({
+      departmentId: a.id().required(),
+      departmentGroup: a.string().required(),
+      title: a.string().required(),
+      kind: a.string(), // call | meeting | email | task
+      dueAt: a.datetime(),
+      done: a.boolean(),
+      doneAt: a.datetime(),
+      ownerId: a.string(),
+      ticketId: a.id(),
+      leadId: a.id(),
+      contactId: a.id(),
+      notes: a.string(),
+      createdBy: a.string(),
+    })
+    .authorization((allow) => [
+      allow.groups(["MANAGERS"]),
+      allow.groupDefinedIn("departmentGroup").to(["create", "read", "update"]),
+    ]),
+
+  /* ---------- Support CRM ---------- */
+  // Equipment the team looks after: tills, tablets, printers, routers… per customer site.
+  Asset: a
+    .model({
+      departmentId: a.id().required(),
+      departmentGroup: a.string().required(),
+      name: a.string().required(),
+      type: a.string(),
+      companyId: a.id(),
+      contactId: a.id(),
+      site: a.string(),
+      make: a.string(),
+      model: a.string(),
+      serial: a.string(),
+      status: a.string(), // in_use | spare | repair | retired
+      installedOn: a.date(),
+      warrantyUntil: a.date(),
+      notes: a.string(),
+      createdBy: a.string(),
+    })
+    .authorization((allow) => [
+      allow.groups(["MANAGERS"]),
+      allow.groupDefinedIn("departmentGroup").to(["create", "read", "update"]),
+    ]),
+
+  // Knowledge base: how-to and fixes the team reuses.
+  Article: a
+    .model({
+      departmentId: a.id().required(),
+      departmentGroup: a.string().required(),
+      title: a.string().required(),
+      category: a.string(),
+      body: a.string().required(),
+      tags: a.string(),
+      createdBy: a.string(),
+      updatedBy: a.string(),
+    })
+    .authorization((allow) => [
+      allow.groups(["MANAGERS"]),
+      allow.groupDefinedIn("departmentGroup").to(["create", "read", "update"]),
     ]),
 
   Company: a

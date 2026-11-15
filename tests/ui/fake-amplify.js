@@ -7,7 +7,7 @@ let db = JSON.parse(LS.getItem("fake-aws") || "null") || {
     "hello@soustap.com": { sub: "u-owner", name: "Manager", groups: ["MANAGERS", "STAFF"], password: "TempPass1!", status: "FORCE_CHANGE_PASSWORD", enabled: true, mfa: false, owner: true },
   },
   cognitoGroups: ["MANAGERS", "STAFF"],
-  t: { Profile: [], Department: [], Ticket: [], TicketActivity: [], Company: [], Contact: [] },
+  t: { Profile: [], Department: [], Ticket: [], TicketActivity: [], Company: [], Contact: [], Lead: [], SalesTask: [], Asset: [], Article: [] },
   counters: {}, current: null, challenge: null, n: 0, invites: 0,
 };
 const save = () => LS.setItem("fake-aws", JSON.stringify(db));
@@ -24,6 +24,10 @@ const RULES = {
   Department: { read: r => mgr() || has(r.groupName), create: mgr, update: mgr, del: mgr },
   Ticket: { read: r => mgr() || has(r.departmentGroup), create: r => mgr() || has(r.departmentGroup), update: r => mgr() || has(r.departmentGroup), del: mgr },
   TicketActivity: { read: r => mgr() || has(r.departmentGroup), create: r => mgr() || has(r.departmentGroup), update: mgr, del: mgr },
+  Lead: { read: r => mgr() || has(r.departmentGroup), create: r => mgr() || has(r.departmentGroup), update: r => mgr() || has(r.departmentGroup), del: mgr },
+  SalesTask: { read: r => mgr() || has(r.departmentGroup), create: r => mgr() || has(r.departmentGroup), update: r => mgr() || has(r.departmentGroup), del: mgr },
+  Asset: { read: r => mgr() || has(r.departmentGroup), create: r => mgr() || has(r.departmentGroup), update: r => mgr() || has(r.departmentGroup), del: mgr },
+  Article: { read: r => mgr() || has(r.departmentGroup), create: r => mgr() || has(r.departmentGroup), update: r => mgr() || has(r.departmentGroup), del: mgr },
   Company: { read: staff, create: staff, update: staff, del: mgr },
   Contact: { read: staff, create: staff, update: staff, del: mgr },
 };

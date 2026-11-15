@@ -200,3 +200,42 @@ tr.picked td{background:#fff5f5}
 .bulkbar .btn{background:#232a36;color:#fff;border-color:#2b3341}
 .bulkbar .btn.danger{background:var(--bad);border-color:var(--bad);color:#fff}
 .bulkbar .btn.danger.armed{background:#7f1d1d}
+
+/* each department's CRM: section tabs */
+.tabs{display:flex;gap:4px;border-bottom:1px solid var(--line);margin:-6px 0 16px;overflow-x:auto}
+.tabs a{display:flex;align-items:center;gap:7px;padding:9px 14px;color:var(--muted);text-decoration:none;font-weight:500;border-bottom:2px solid transparent;margin-bottom:-1px;white-space:nowrap}
+.tabs a:hover{color:var(--ink)}
+.tabs a.on{color:var(--ink);border-bottom-color:var(--c,var(--ink))}
+.tabs .count{font-size:11px;background:#eef0f3;color:#4b5563;padding:1px 7px;border-radius:10px}
+.tabs .count.alert{background:var(--bad);color:#fff}
+
+/* leads */
+.ld-new{background:#e0e7ff;color:#3730a3}.ld-contacted{background:#fef9c3;color:#854d0e}.ld-qualified{background:#dcfce7;color:#166534}
+.ld-unqualified{background:#f1f5f9;color:#64748b}.ld-converted{background:#ede9fe;color:#5b21b6}
+.convert{display:flex;align-items:center;gap:10px;margin-bottom:16px;padding:12px;background:#f5f3ff;border:1px solid #ddd6fe;border-radius:8px}
+
+/* activities & tasks */
+.tasks .task{display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:12px;align-items:center;padding:11px 14px;border-bottom:1px solid var(--line);cursor:pointer}
+.tasks .task:last-child{border-bottom:0}
+.tasks .task:hover{background:#fafbff}
+.tasks .task.done .b{text-decoration:line-through;color:var(--muted)}
+.tasks .tdone{width:17px;height:17px;cursor:pointer;accent-color:var(--ok)}
+.tasks .tdue{text-align:right;font-size:13px;white-space:nowrap}
+.tasks-in .tasks{border:1px solid var(--line);border-radius:8px;overflow:hidden}
+.tk-call{background:#e0f2fe;color:#0369a1}.tk-meeting{background:#ede9fe;color:#5b21b6}.tk-email{background:#fef9c3;color:#854d0e}.tk-task{background:#f1f5f9;color:#475569}
+
+/* assets */
+.as-in_use{background:#dcfce7;color:#166534}.as-spare{background:#e0f2fe;color:#0369a1}.as-repair{background:#ffedd5;color:#c2410c}.as-retired{background:#f1f5f9;color:#64748b}
+
+/* knowledge base */
+.kb{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:14px}
+.kbcard{display:flex;flex-direction:column;gap:8px;align-items:flex-start;text-align:left;background:#fff;border:1px solid var(--line);border-radius:var(--radius);padding:16px;color:inherit}
+.kbcard:hover{box-shadow:0 4px 14px rgba(0,0,0,.06);border-color:#d1d5db}
+.kbt{font-weight:600;font-size:15px}
+.kbs{color:#4b5563;font-size:13px;line-height:1.5}
+.article{white-space:pre-wrap;line-height:1.65;font-size:14.5px}
+
+@media(max-width:900px){
+  .tasks .task{grid-template-columns:auto minmax(0,1fr)}
+  .tasks .tdue{grid-column:2;text-align:left}
+}
